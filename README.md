@@ -36,7 +36,7 @@ This project simply calls `query()` from Anthropic's public npm package using yo
 | **Concurrent requests** | Subagents and title generation don't block each other |
 | **Any Anthropic model** | Works with opus, sonnet, and haiku |
 | **Session resume** | Conversations persist across requests — faster responses, better context |
-| **Full test coverage** | 46 tests covering tool execution, streaming, subagents, sessions, and concurrency |
+| **Full test coverage** | 50 tests covering tool execution, streaming, subagents, sessions, and concurrency |
 
 ## Prerequisites
 
@@ -222,7 +222,7 @@ launchctl load ~/Library/LaunchAgents/com.claude-max-proxy.plist
 bun test
 ```
 
-46 tests covering:
+50 tests covering:
 - Tool use forwarding (streaming and non-streaming)
 - MCP tool filtering (internal tools hidden from client)
 - Subagent concurrent request handling
