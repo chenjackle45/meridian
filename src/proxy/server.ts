@@ -939,30 +939,35 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
   const { app, config: finalConfig } = createProxyServer(config)
 
-  let server
-  try {
-    server = Bun.serve({
-      port: finalConfig.port,
-      hostname: finalConfig.host,
-      idleTimeout: finalConfig.idleTimeoutSeconds,
-      fetch: app.fetch
-    })
-  } catch (error: unknown) {
-    if (error instanceof Error && "code" in error && error.code === "EADDRINUSE") {
-      console.error(`\nError: Port ${finalConfig.port} is already in use.`)
-      console.error(`\nIs another instance of the proxy already running?`)
-      console.error(`  Check with: lsof -i :${finalConfig.port}`)
-      console.error(`  Kill it with: kill $(lsof -ti :${finalConfig.port})`)
-      console.error(`\nOr use a different port:`)
-      console.error(`  CLAUDE_PROXY_PORT=4567 bun run proxy`)
-      process.exit(1)
+  const { serve } = await import("@hono/node-server")
+
+  return new Promise<void>((resolve, reject) => {
+    try {
+      const server = serve({
+        fetch: app.fetch,
+        port: finalConfig.port,
+        hostname: finalConfig.host,
+      }, () => {
+        console.log(`Claude Max Proxy (Anthropic API) running at http://${finalConfig.host}:${finalConfig.port}`)
+        console.log(`\nTo use with OpenCode, run:`)
+        console.log(`  ANTHROPIC_API_KEY=dummy ANTHROPIC_BASE_URL=http://${finalConfig.host}:${finalConfig.port} opencode`)
+        resolve()
+      })
+
+      server.on("error", (error: NodeJS.ErrnoException) => {
+        if (error.code === "EADDRINUSE") {
+          console.error(`\nError: Port ${finalConfig.port} is already in use.`)
+          console.error(`\nIs another instance of the proxy already running?`)
+          console.error(`  Check with: lsof -i :${finalConfig.port}`)
+          console.error(`  Kill it with: kill $(lsof -ti :${finalConfig.port})`)
+          console.error(`\nOr use a different port:`)
+          console.error(`  CLAUDE_PROXY_PORT=4567 bun run proxy`)
+          process.exit(1)
+        }
+        reject(error)
+      })
+    } catch (error) {
+      reject(error)
     }
-    throw error
-  }
-
-  console.log(`Claude Max Proxy (Anthropic API) running at http://${finalConfig.host}:${finalConfig.port}`)
-  console.log(`\nTo use with OpenCode, run:`)
-  console.log(`  ANTHROPIC_API_KEY=dummy ANTHROPIC_BASE_URL=http://${finalConfig.host}:${finalConfig.port} opencode`)
-
-  return server
+  })
 }

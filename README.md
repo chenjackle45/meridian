@@ -158,15 +158,15 @@ Sessions are cached for 24 hours.
 
 ## Concurrency
 
-The proxy supports multiple simultaneous OpenCode instances. Each request spawns its own independent SDK subprocess — there's no serialization bottleneck. Run as many terminals as you want.
+The proxy supports multiple simultaneous OpenCode instances. Each request spawns its own independent SDK subprocess — there's no serialization bottleneck. All concurrent responses are delivered correctly.
 
-For production use, use the auto-restart supervisor:
+**Use the auto-restart supervisor** (recommended):
 
 ```bash
 CLAUDE_PROXY_PASSTHROUGH=1 ./bin/claude-proxy-supervisor.sh
 ```
 
-The Bun runtime occasionally crashes during stream cleanup after concurrent requests complete. All responses are delivered correctly — the crash only happens during post-response cleanup. The supervisor detects this and restarts in ~1 second, so subsequent requests work immediately.
+The Claude Agent SDK's `cli.js` subprocess is compiled with Bun, which has a [known bug](https://github.com/oven-sh/bun/issues/17947) that can crash during cleanup of concurrent streaming responses. **All responses are delivered** — the crash only occurs after responses complete. The supervisor restarts the proxy in ~1 second, so subsequent requests work immediately. Sequential requests never crash.
 
 ## Model Mapping
 
