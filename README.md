@@ -369,3 +369,5 @@ MIT
 ## Credits
 
 Built with the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) by Anthropic.
+
+[opencode-with-claude](https://github.com/ianjwhite99/opencode-with-claude) installer by [@ianjwhite99](https://github.com/ianjwhite99). Multimodal support based on work by [@juanferreiramorel](https://github.com/juanferreiramorel). Per-terminal proxy idea by [@calebdw](https://github.com/calebdw). README cleanup by [@skipships](https://github.com/skipships).
