@@ -16,6 +16,7 @@ function makeContext(overrides: Partial<QueryContext> = {}): QueryContext {
     stream: false,
     sdkAgents: {},
     cleanEnv: {},
+    hasDeferredTools: false,
     isUndo: false,
     adapter: openCodeAdapter,
     ...overrides,

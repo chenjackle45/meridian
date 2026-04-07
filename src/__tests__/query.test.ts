@@ -130,6 +130,7 @@ describe("buildQueryOptions", () => {
     const mockPassthroughMcp = {
       toolNames: ["mcp__passthrough__custom_tool"],
       server: {} as any,
+      hasDeferredTools: false,
     }
     const result = buildQueryOptions(makeContext({
       passthrough: true,
