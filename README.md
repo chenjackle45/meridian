@@ -509,9 +509,39 @@ await instance.close()
 
 ## Docker
 
+Claude Code authentication requires a browser, which isn't available inside containers. Authenticate on your local machine first, then mount the credentials into Docker.
+
+### Single account
+
 ```bash
+# 1. Authenticate locally (one time)
+claude login
+
+# 2. Run with mounted credentials
 docker run -v ~/.claude:/home/claude/.claude -p 3456:3456 meridian
 ```
+
+Meridian refreshes OAuth tokens automatically — once the credentials are mounted, no further browser access is needed.
+
+### Multiple profiles in Docker
+
+Authenticate each profile locally, then pass them to Docker via the `MERIDIAN_PROFILES` environment variable:
+
+```bash
+# 1. Authenticate each account locally
+meridian profile add personal
+meridian profile add work    # sign out of claude.ai first, sign into work account
+
+# 2. Run Docker with profile configs pointing to mounted credential directories
+docker run \
+  -v ~/.config/meridian/profiles/personal:/profiles/personal \
+  -v ~/.config/meridian/profiles/work:/profiles/work \
+  -e 'MERIDIAN_PROFILES=[{"id":"personal","claudeConfigDir":"/profiles/personal"},{"id":"work","claudeConfigDir":"/profiles/work"}]' \
+  -e MERIDIAN_DEFAULT_PROFILE=personal \
+  -p 3456:3456 meridian
+```
+
+Switch profiles at runtime via the `x-meridian-profile` header or `meridian profile switch` (see [Multi-Profile Support](#multi-profile-support)).
 
 ## Testing
 
