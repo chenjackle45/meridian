@@ -39,7 +39,7 @@ export function patchSource(src) {
   //    e.g. import { __INVALID__REF__ } from "./server.js";
   out = out.replace(
     /^import\s*\{\s*__INVALID__REF__\s*\}\s*from\s*"[^"]*"\s*;?\s*\n?/gm,
-    ""
+    "",
   );
 
   // 2. Find all export blocks (both single-line and multi-line).
@@ -57,9 +57,8 @@ export function patchSource(src) {
     // the newline before `}` and produced output like `realThing};`.
     if (blocks[0][0].includes("__INVALID__REF__")) {
       const symbols = extractExportSymbols(blocks[0][0]);
-      const cleaned = symbols.length > 0
-        ? `export {\n  ${symbols.join(",\n  ")}\n};`
-        : "";
+      const cleaned =
+        symbols.length > 0 ? `export {\n  ${symbols.join(",\n  ")}\n};` : "";
       out = out.replace(blocks[0][0], cleaned);
     }
 
@@ -67,11 +66,27 @@ export function patchSource(src) {
     for (let i = blocks.length - 1; i >= 1; i--) {
       const block = blocks[i][0];
       const symbols = extractExportSymbols(block);
-      if (
-        symbols.length === 0 ||
-        symbols.every((s) => canonicalSymbols.has(s))
-      ) {
+      if (symbols.length === 0) {
         out = out.replace(block, "");
+        continue;
+      }
+      const newSymbols = symbols.filter((s) => !canonicalSymbols.has(s));
+      if (newSymbols.length === 0) {
+        // All duplicates — drop the block entirely.
+        out = out.replace(block, "");
+      } else if (newSymbols.length < symbols.length) {
+        // Partial overlap — rewrite with only the new symbols and absorb them
+        // into the canonical set so later blocks dedup against them too.
+        // Without this branch Bun's split chunks emit redundant symbols across
+        // multiple `export {}` blocks and Node throws SyntaxError: Duplicate
+        // export at module load.
+        const cleaned = `export { ${newSymbols.join(", ")} };`;
+        out = out.replace(block, cleaned);
+        for (const s of newSymbols) canonicalSymbols.add(s);
+      } else {
+        // Fully new symbols — leave the block untouched but absorb so later
+        // blocks dedup against it.
+        for (const s of newSymbols) canonicalSymbols.add(s);
       }
     }
   }
