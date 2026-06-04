@@ -58,6 +58,14 @@ function promptText(): string {
   return String(p)
 }
 
+/** Collect the structured (AsyncIterable) prompt into an array of SDK messages. */
+async function collectStructuredPrompt(): Promise<any[]> {
+  const p = capturedQueryParams?.prompt
+  const messages: any[] = []
+  for await (const msg of p) messages.push(msg)
+  return messages
+}
+
 // pi adapter forced via x-meridian-agent header; passthrough off for a plain
 // text-prompt path so we can assert on the flattened string.
 const PI = { "x-meridian-agent": "pi" }
@@ -148,5 +156,97 @@ describe("M2: pi adapter strips inbound <system-reminder>", () => {
     const prompt = promptText()
     expect(prompt).toContain("How should I handle a system reminder feature")
     expect(prompt).toContain("Keep the design simple.")
+  })
+
+  // M2 (multimodal path): when a message carries an image/document/file block,
+  // the proxy builds a STRUCTURED prompt instead of flattening to text. The
+  // user-authored text blocks on that path must be sanitized the same way the
+  // text path is — otherwise <system-reminder> leaks straight through. The
+  // attachment block itself must be preserved untouched.
+
+  it("strips <system-reminder> from text blocks on the multimodal (image) path while keeping the image", async () => {
+    const app = createTestApp()
+    await (await post(app, {
+      model: "claude-sonnet-4-5-20250929",
+      max_tokens: 1024,
+      stream: false,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `<system-reminder>\nCurrent working directory: /home/user/.openclaw/workspace\n</system-reminder>\nwhat is in this screenshot?`,
+            },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "iVBORimagedata" },
+            },
+          ],
+        },
+      ],
+    }, PI)).json()
+
+    // Multimodal → structured prompt (AsyncIterable, not a string).
+    expect(typeof capturedQueryParams.prompt).not.toBe("string")
+    const msgs = await collectStructuredPrompt()
+
+    // The user message's text block must be sanitized.
+    const flat = JSON.stringify(msgs)
+    expect(flat).not.toContain("system-reminder")
+    expect(flat).not.toContain("/home/user/.openclaw/workspace")
+    // The real question survives.
+    expect(flat).toContain("what is in this screenshot?")
+
+    // The image block is preserved untouched.
+    const imageMsg = msgs.find(
+      (m: any) =>
+        Array.isArray(m.message?.content) &&
+        m.message.content.some((b: any) => b.type === "image"),
+    )
+    expect(imageMsg).toBeDefined()
+    const imageBlock = imageMsg.message.content.find((b: any) => b.type === "image")
+    expect(imageBlock.source.data).toBe("iVBORimagedata")
+  })
+
+  it("strips <system-reminder> from text blocks on the multimodal (document) path while keeping the document", async () => {
+    const app = createTestApp()
+    await (await post(app, {
+      model: "claude-sonnet-4-5-20250929",
+      max_tokens: 1024,
+      stream: false,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `<system-reminder>\nCWD: /tmp/secret-host\n</system-reminder>\nsummarize this pdf`,
+            },
+            {
+              type: "document",
+              source: { type: "base64", media_type: "application/pdf", data: "JVBERdocdata" },
+            },
+          ],
+        },
+      ],
+    }, PI)).json()
+
+    expect(typeof capturedQueryParams.prompt).not.toBe("string")
+    const msgs = await collectStructuredPrompt()
+    const flat = JSON.stringify(msgs)
+
+    expect(flat).not.toContain("system-reminder")
+    expect(flat).not.toContain("/tmp/secret-host")
+    expect(flat).toContain("summarize this pdf")
+
+    const docMsg = msgs.find(
+      (m: any) =>
+        Array.isArray(m.message?.content) &&
+        m.message.content.some((b: any) => b.type === "document"),
+    )
+    expect(docMsg).toBeDefined()
+    const docBlock = docMsg.message.content.find((b: any) => b.type === "document")
+    expect(docBlock.source.data).toBe("JVBERdocdata")
   })
 })

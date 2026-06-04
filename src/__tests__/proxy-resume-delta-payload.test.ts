@@ -143,6 +143,39 @@ describe("resume delta keeps the current turn's user message (e2e)", () => {
     expect(promptText()).toContain("LATEST_USER_QUESTION")
   })
 
+  it("does not re-send the prior assistant turn and ends on the user message", async () => {
+    const app = createTestApp()
+
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [{ role: "user", content: "open question" }],
+    }, { "x-opencode-session": "boundary-session" })).json()
+
+    mockMessages = [assistantMessage([{ type: "text", text: "Answer" }])]
+
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [
+        { role: "user", content: "open question" },
+        { role: "assistant", content: [{ type: "text", text: "PRIOR_ASSISTANT_REPLY" }] },
+        { role: "user", content: "BOUNDARY_CURRENT_USER" },
+        { role: "assistant", content: [{ type: "text", text: "TRAILING_SCAFFOLD" }] },
+      ],
+    }, { "x-opencode-session": "boundary-session" })).json()
+
+    const prompt = promptText()
+    // Current user turn is forwarded.
+    expect(prompt).toContain("BOUNDARY_CURRENT_USER")
+    // The SDK already holds its own prior reply — it must not be re-sent.
+    expect(prompt).not.toContain("PRIOR_ASSISTANT_REPLY")
+    // Trailing scaffold after the user turn is truncated.
+    expect(prompt).not.toContain("TRAILING_SCAFFOLD")
+  })
+
   it("keeps the current user message on a streaming resume", async () => {
     const app = createTestApp()
 

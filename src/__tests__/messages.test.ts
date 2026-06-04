@@ -162,6 +162,54 @@ describe("selectResumeDelta", () => {
     expect(delta).toHaveLength(1)
     expect(delta[0]!.role).toBe("assistant")
   })
+
+  // --- BOUNDARY fix: bound the delta to the last user turn ---
+
+  it("BOUNDARY: drops the prior assistant the SDK already has (does not re-send it)", () => {
+    // [user0, assistant0, user1], knownCount=1: a naive slice(1) returns
+    // [assistant0, user1], re-sending the SDK's own prior reply. The fix bounds
+    // the delta to the last user turn, so only [user1] is forwarded.
+    const msgs = [u("q0"), a("a0"), u("q1")]
+    const delta = selectResumeDelta(msgs, 1)
+    expect(delta.map((m) => m.role)).toEqual(["user"])
+    expect(delta.map((m) => m.content)).toEqual(["q1"])
+    // The prior assistant text must not be present in the delta.
+    expect(delta.some((m) => m.role === "assistant")).toBe(false)
+  })
+
+  it("BOUNDARY: truncates trailing non-user scaffold so the delta ends on the user turn", () => {
+    // [user0, assistant0, user1, assistant_scaffold], knownCount=1.
+    const msgs = [u("q0"), a("a0"), u("q1"), a("trailing scaffold")]
+    const delta = selectResumeDelta(msgs, 1)
+    expect(delta.map((m) => m.content)).toEqual(["q1"])
+    // Ends on the user turn — no trailing assistant scaffold.
+    expect(delta[delta.length - 1]!.role).toBe("user")
+    expect(delta.some((m) => m.content === "trailing scaffold")).toBe(false)
+  })
+
+  it("BOUNDARY: keeps intermediate new user turns, dropping only the leading prior assistant", () => {
+    // A multi-turn batch arrives at once: knownCount lands on a leading
+    // assistant, but the intermediate user turn is genuinely new and must stay.
+    const msgs = [u("q0"), a("a0"), u("q1"), a("a1"), u("q2")]
+    // SDK last knew 2 messages (q0, a0). slice(2) = [u1, a1, u2]; first element
+    // is a user, so nothing is dropped from the front; ends on u2. (Assistant
+    // content is a block array, so compare roles + user-message text.)
+    const delta = selectResumeDelta(msgs, 2)
+    expect(delta.map((m) => m.role)).toEqual(["user", "assistant", "user"])
+    expect(delta.filter((m) => m.role === "user").map((m) => m.content)).toEqual(["q1", "q2"])
+    expect(delta[delta.length - 1]!.role).toBe("user")
+  })
+
+  it("BOUNDARY: drops a leading prior assistant in a multi-turn batch but keeps the rest", () => {
+    const msgs = [u("q0"), a("a0"), u("q1"), a("a1"), u("q2")]
+    // knownCount=1 -> slice starts at a0 (assistant). Drop the single leading
+    // assistant, keep [u1, a1, u2], end on u2.
+    const delta = selectResumeDelta(msgs, 1)
+    expect(delta.map((m) => m.role)).toEqual(["user", "assistant", "user"])
+    expect(delta.filter((m) => m.role === "user").map((m) => m.content)).toEqual(["q1", "q2"])
+    expect(delta[0]!.role).toBe("user")
+    expect(delta[delta.length - 1]!.role).toBe("user")
+  })
 })
 
 describe("extractAdvisorModel", () => {

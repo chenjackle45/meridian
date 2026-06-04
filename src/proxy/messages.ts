@@ -111,6 +111,18 @@ function lastUserIndex(messages: Array<{ role: string; content: any }>): number 
  * falls back to forwarding just that last user message. This is byte-identical
  * to today for the well-behaved case (the user turn is at or after knownCount)
  * and only changes behavior when a drop would otherwise occur.
+ *
+ * BOUNDARY (second fix): the delta is bounded by the *last user turn*, not the
+ * raw array tail. Two adjustments to the naive `slice(knownCount)`:
+ *  - drop any leading non-user (prior assistant) messages — the SDK already
+ *    holds its own prior outputs in session, so re-sending them duplicates
+ *    history; and
+ *  - truncate any trailing non-user scaffold *after* the last user message, so
+ *    the forwarded prompt always ends on the user's question.
+ * Re-sending the prior assistant and ending on a scaffold made the prompt end
+ * with an assistant turn, which could reproduce the "sees it but doesn't reply"
+ * symptom. Bounding to the last user turn keeps the model answering the current
+ * question.
  */
 export function selectResumeDelta(
   allMessages: Array<{ role: string; content: any }>,
@@ -127,7 +139,12 @@ export function selectResumeDelta(
     // question — fall back to forwarding just the last user message so the
     // model always sees the current turn.
     if (knownCount <= userIdx) {
-      return allMessages.slice(knownCount)
+      // Drop leading prior-assistant messages the SDK already has (start the
+      // delta at the first new user message), and truncate any trailing
+      // non-user scaffold after the last user turn (end at userIdx + 1).
+      let start = knownCount
+      while (start < userIdx && allMessages[start]?.role !== "user") start++
+      return allMessages.slice(start, userIdx + 1)
     }
     return getLastUserMessage(allMessages)
   }

@@ -122,20 +122,35 @@ function stripCacheControlDeep(content: any): any {
   })
 }
 
-function normalizeStructuredUserContent(content: any): any {
+function normalizeStructuredUserContent(
+  content: any,
+  sanitizeOpts: import("./sanitize").SanitizeOptions = {}
+): any {
   if (!Array.isArray(content)) return content
   const normalized: any[] = []
   for (const block of content) {
     if (!block || typeof block !== "object") continue
     if (block.type === "tool_result" && Array.isArray(block.content) && hasMultimodalContent(block.content)) {
-      normalized.push(...normalizeStructuredUserContent(block.content))
+      normalized.push(...normalizeStructuredUserContent(block.content, sanitizeOpts))
       continue
     }
     if (block.type === "tool_result" && Array.isArray(block.content)) {
       normalized.push({
         ...block,
-        content: normalizeStructuredUserContent(block.content),
+        content: normalizeStructuredUserContent(block.content, sanitizeOpts),
       })
+      continue
+    }
+    // M2: sanitize user-authored text blocks on the structured (multimodal)
+    // path too — the text-prompt path strips orchestration wrappers via
+    // flattenUserContent, but multimodal requests bypassed that, letting
+    // `<system-reminder>` (and other wrappers) leak into the model's view.
+    // Image/document/file blocks are passed through untouched.
+    if (block.type === "text" && typeof block.text === "string") {
+      const cleaned = sanitizeTextContent(block.text, sanitizeOpts)
+      // Drop blocks that sanitize to empty (the whole block was a wrapper) so
+      // we never emit an empty text block alongside the surviving attachment.
+      if (cleaned) normalized.push({ ...block, text: cleaned })
       continue
     }
     normalized.push(block)
@@ -214,7 +229,7 @@ function buildFreshPrompt(
       if (m.role === "user") {
         structured.push({
           type: "user" as const,
-          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+          message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content), sanitizeOpts) },
           parent_tool_use_id: null,
         })
       } else {
@@ -736,7 +751,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             if (m.role === "user") {
               structuredMessages.push({
                 type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content), sanitizeOpts) },
                 parent_tool_use_id: null,
               })
             }
@@ -747,7 +762,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
             if (m.role === "user") {
               structuredMessages.push({
                 type: "user" as const,
-                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content)) },
+                message: { role: "user" as const, content: normalizeStructuredUserContent(stripCacheControlDeep(m.content), sanitizeOpts) },
                 parent_tool_use_id: null,
               })
             } else {
