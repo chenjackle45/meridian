@@ -2,7 +2,7 @@
  * Unit tests for message parsing utilities.
  */
 import { describe, it, expect } from "bun:test"
-import { normalizeContent, getLastUserMessage, extractAdvisorModel, stripAdvisorTools } from "../proxy/messages"
+import { normalizeContent, getLastUserMessage, selectResumeDelta, extractAdvisorModel, stripAdvisorTools } from "../proxy/messages"
 
 describe("normalizeContent", () => {
   it("returns string content as-is", () => {
@@ -105,6 +105,62 @@ describe("getLastUserMessage", () => {
     const result = getLastUserMessage(messages)
     expect(result).toHaveLength(1)
     expect(result[0]!.content).toBe("only")
+  })
+})
+
+describe("selectResumeDelta", () => {
+  // Helpers to build small conversations.
+  const u = (c: string) => ({ role: "user", content: c })
+  const a = (c: string) => ({ role: "assistant", content: [{ type: "text", text: c }] })
+
+  it("returns the tail slice for a well-behaved continuation (user is the array tail)", () => {
+    const msgs = [u("q0"), a("a0"), u("q1")]
+    // Previous turn recorded 2 messages; the new user message is at index 2.
+    const delta = selectResumeDelta(msgs, 2)
+    expect(delta.map((m) => m.content)).toEqual(["q1"])
+  })
+
+  it("includes the current user message even when trailing messages follow it", () => {
+    const msgs = [u("q0"), a("a0"), u("q1"), a("scaffold")]
+    const delta = selectResumeDelta(msgs, 2)
+    // The slice keeps the user message AND the trailing scaffold — but crucially
+    // the user's question is present.
+    expect(delta.some((m) => m.role === "user" && m.content === "q1")).toBe(true)
+  })
+
+  it("SENTINEL: does not drop the current user message when knownCount drifts past it", () => {
+    // Reproduction of the production bug: the new user question sits at index 4,
+    // but the recorded count drifted to 5 (e.g. a stale count from a prior
+    // early-break turn). A naive slice(5) returns [a("a2")] — history only, no
+    // user content — and the model answers nothing (NO_REPLY).
+    const msgs = [u("q0"), a("a0"), u("q1"), a("a1"), u("q2"), a("a2")]
+    const naive = msgs.slice(5)
+    expect(naive.some((m) => m.role === "user")).toBe(false) // demonstrates the bug surface
+
+    const delta = selectResumeDelta(msgs, 5)
+    // The fix falls back to the last user message so the question always lands.
+    expect(delta.some((m) => m.role === "user" && m.content === "q2")).toBe(true)
+  })
+
+  it("SENTINEL: drift where the user message is the tail still recovers it", () => {
+    const msgs = [u("q0"), a("a0"), u("q1")]
+    // knownCount drifted past everything (== length): legacy branch already
+    // falls back to last user — assert it stays correct.
+    const delta = selectResumeDelta(msgs, 3)
+    expect(delta.map((m) => m.content)).toEqual(["q1"])
+  })
+
+  it("falls back to last user message when knownCount is 0 (legacy/first store)", () => {
+    const msgs = [u("q0"), a("a0"), u("q1")]
+    const delta = selectResumeDelta(msgs, 0)
+    expect(delta.map((m) => m.content)).toEqual(["q1"])
+  })
+
+  it("degenerates gracefully when there is no user message", () => {
+    const msgs = [a("a0"), a("a1")]
+    const delta = selectResumeDelta(msgs, 1)
+    expect(delta).toHaveLength(1)
+    expect(delta[0]!.role).toBe("assistant")
   })
 })
 

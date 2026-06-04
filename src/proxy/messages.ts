@@ -80,3 +80,57 @@ export function getLastUserMessage(messages: Array<{ role: string; content: any 
   }
   return messages.slice(-1)
 }
+
+/**
+ * Return the index of the last user message, or -1 if none.
+ */
+function lastUserIndex(messages: Array<{ role: string; content: any }>): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") return i
+  }
+  return -1
+}
+
+/**
+ * Pick the slice of messages to forward to the SDK on a session resume.
+ *
+ * The SDK already holds the conversation history, so we only forward the
+ * "new" tail: `allMessages.slice(knownCount)`, where knownCount is the message
+ * count recorded on a previous turn.
+ *
+ * SENTINEL (the fix): the recorded count can drift — a prior turn may have
+ * ended on an early break that left a stale count, or the client array can
+ * advance by a different amount than the proxy recorded. When that happens a
+ * naive slice can land at or past the current turn's user message and drop it
+ * entirely. The SDK then receives a delta with NO user content and the model
+ * produces an empty / NO_REPLY turn (in production this silently swallowed
+ * 31+ user questions).
+ *
+ * To stay caller-agnostic, this helper never trusts the slice blindly: if the
+ * slice would start past the conversation's current last user message, it
+ * falls back to forwarding just that last user message. This is byte-identical
+ * to today for the well-behaved case (the user turn is at or after knownCount)
+ * and only changes behavior when a drop would otherwise occur.
+ */
+export function selectResumeDelta(
+  allMessages: Array<{ role: string; content: any }>,
+  knownCount: number,
+): Array<{ role: string; content: any }> {
+  const userIdx = lastUserIndex(allMessages)
+
+  // No user message at all (degenerate) — fall back to the legacy behavior.
+  if (userIdx < 0) return getLastUserMessage(allMessages)
+
+  if (knownCount > 0 && knownCount < allMessages.length) {
+    // Sentinel: the slice start must sit at or before the current last user
+    // message. If knownCount drifted past it, the slice would omit the user's
+    // question — fall back to forwarding just the last user message so the
+    // model always sees the current turn.
+    if (knownCount <= userIdx) {
+      return allMessages.slice(knownCount)
+    }
+    return getLastUserMessage(allMessages)
+  }
+
+  return getLastUserMessage(allMessages)
+}

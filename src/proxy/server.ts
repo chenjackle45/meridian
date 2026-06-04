@@ -49,7 +49,7 @@ import { checkPluginConfigured } from "./setup"
 import { mapModelToClaudeModel, resolveClaudeExecutableAsync, resolveSdkModelDefaults, isClosedControllerError, getClaudeAuthStatusAsync, getAuthCacheInfo, getResolvedClaudeExecutableInfo, hasExtendedContext, stripExtendedContext, recordExtendedContextUnavailable } from "./models"
 import type { AnthropicSseEvent } from "./openai"
 import { translateOpenAiToAnthropic, translateAnthropicToOpenAi, buildModelList, createSseTranslator } from "./openai"
-import { extractAdvisorModel, getLastUserMessage, stripAdvisorTools } from "./messages"
+import { extractAdvisorModel, getLastUserMessage, selectResumeDelta, stripAdvisorTools } from "./messages"
 import { requireAuth, authEnabled } from "./auth"
 import { detectAdapter } from "./adapters/detect"
 import { buildQueryOptions, type QueryContext } from "./query"
@@ -703,12 +703,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
           // so we only need to send the new user message.
           messagesToConvert = getLastUserMessage(allMessages)
         } else if (isResume) {
-          const knownCount = cachedSession.messageCount || 0
-          if (knownCount > 0 && knownCount < allMessages.length) {
-            messagesToConvert = allMessages.slice(knownCount)
-          } else {
-            messagesToConvert = getLastUserMessage(allMessages)
-          }
+          // selectResumeDelta keeps the slice behavior but guards against a
+          // drifted messageCount dropping the current turn's user message
+          // (see helper — production swallowed 31+ questions via a naive slice).
+          messagesToConvert = selectResumeDelta(allMessages, cachedSession.messageCount || 0)
         } else {
           // Undo without UUID (legacy session) — fall back to last user message
           // to avoid the catastrophic flat text replay.
