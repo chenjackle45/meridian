@@ -110,11 +110,13 @@ describe("SystemReminderStreamStripper", () => {
     expect(out).not.toContain("partial leak")
   })
 
-  it("flush drops a stream that ends on a strict partial opener (<system-rem)", () => {
-    // EOF lands mid-opener: `<system-rem`. flush() must not emit the half tag.
+  it("flush emits a stream that ends on a strict partial opener (<system-rem) — legal literal (codex r3)", () => {
+    // EOF lands on a strict prefix of the opener. r2 dropped it (half-leak
+    // paranoia); codex r3 flipped this: a prefix that never completed the tag
+    // name is overwhelmingly legitimate literal output, and dropping it broke
+    // stream/non-stream parity. Only a *complete* started opener is dropped.
     const out = runStream(["here is the answer <system-rem"])
-    expect(out).toBe("here is the answer ")
-    expect(out).not.toContain("system-rem")
+    expect(out).toBe("here is the answer <system-rem")
   })
 
   it("flush drops a stream that ends on a started-but-unterminated opener (<system-reminder attr)", () => {
@@ -152,5 +154,24 @@ describe("SystemReminderStreamStripper", () => {
 
   it("strips a self-closing reminder mid-stream", () => {
     expect(runStream(["p<system-reminder x='1'", "/>q"])).toBe("pq")
+  })
+})
+
+// codex r3 [M]: EOF strict-prefix tails are legal literal endings — must be
+// emitted (only a complete `<system-reminder` started tail is dropped), and
+// stream/non-stream behaviour must agree.
+describe("flush parity for legal opener-prefix endings (codex r3)", () => {
+  for (const tail of ["<", "<sys", "<system-rem"]) {
+    it(`emits trailing ${JSON.stringify(tail)} at EOF (legal literal, parity with non-stream)`, () => {
+      const s = new SystemReminderStreamStripper()
+      const out = s.push(`literal ${tail}`) + s.flush()
+      expect(out).toBe(`literal ${tail}`)
+      expect(out).toBe(stripSystemReminderBlocks(`literal ${tail}`))
+    })
+  }
+  it("still drops a complete started opener at EOF", () => {
+    const s = new SystemReminderStreamStripper()
+    const out = s.push("safe <system-reminder cwd=/secret") + s.flush()
+    expect(out).toBe("safe ")
   })
 })

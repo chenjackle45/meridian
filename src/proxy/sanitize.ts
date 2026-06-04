@@ -262,16 +262,15 @@ export class SystemReminderStreamStripper {
       return ""
     }
     // Outside a block: the held-back tail may be a half-written opener that
-    // never finished arriving. If the stream ended on a `<system-reminder`
-    // whose `>`/`/>` never came (findStartedOpener) or on a strict prefix of
-    // the opener (partialOpenLength), drop that suspicious tail — a half-leaked
-    // reminder opener is worse than a truncated message. Anything before it is
-    // real content and is emitted.
+    // never finished arriving. Only a *complete* `<system-reminder` literal
+    // (findStartedOpener — full tag name, possibly mid-attributes) is dropped:
+    // that is the high-confidence half-leak case. A mere strict prefix of the
+    // opener (`<`, `<sys`, `<system-rem`) at EOF is far more likely legitimate
+    // literal output than a reminder — emit it as-is to preserve legal endings
+    // and keep stream/non-stream parity (codex r3: dropping prefixes silently
+    // truncated `literal <` while non-stream kept it).
     const startedIdx = findStartedOpener(this.buffer)
-    const safeLen =
-      startedIdx >= 0
-        ? startedIdx
-        : this.buffer.length - partialOpenLength(this.buffer)
+    const safeLen = startedIdx >= 0 ? startedIdx : this.buffer.length
     const out = this.buffer.slice(0, safeLen)
     this.buffer = ""
     return out
