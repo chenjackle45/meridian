@@ -44,6 +44,37 @@ describe("stripSystemReminderBlocks (non-streaming)", () => {
     const input = "I added a system-reminder feature to the UI."
     expect(stripSystemReminderBlocks(input)).toBe(input)
   })
+
+  // M3: non-stream must match the streaming flush — drop unterminated openers.
+
+  it("drops an unterminated <system-reminder>...CWD block that runs to EOF", () => {
+    const input = "keep this <system-reminder>\nCurrent working directory: /home/secret"
+    const out = stripSystemReminderBlocks(input)
+    expect(out).toBe("keep this ")
+    expect(out).not.toContain("/home/secret")
+    expect(out).not.toContain("system-reminder")
+  })
+
+  it("drops a half-written opener whose '>' never arrived (<system-reminder attr)", () => {
+    const input = 'answer text <system-reminder id="sr-1"'
+    const out = stripSystemReminderBlocks(input)
+    expect(out).toBe("answer text ")
+    expect(out).not.toContain("system-reminder")
+  })
+
+  it("matches the streaming stripper's EOF behavior for an unterminated block", () => {
+    const input = "preamble <system-reminder>leak that never closes"
+    const nonStream = stripSystemReminderBlocks(input)
+    const streamed = runStream([input])
+    expect(nonStream).toBe(streamed)
+    expect(nonStream).toBe("preamble ")
+  })
+
+  it("does not over-strip a mere prefix-like mention without the full opener", () => {
+    // `<system-rem` alone (not the full `<system-reminder` literal) is real prose.
+    const input = "discuss <system-rem in a sentence"
+    expect(stripSystemReminderBlocks(input)).toBe(input)
+  })
 })
 
 describe("SystemReminderStreamStripper", () => {
@@ -77,6 +108,20 @@ describe("SystemReminderStreamStripper", () => {
     const out = runStream(["keep <system-reminder>partial leak that never closes"])
     expect(out).toBe("keep ")
     expect(out).not.toContain("partial leak")
+  })
+
+  it("flush drops a stream that ends on a strict partial opener (<system-rem)", () => {
+    // EOF lands mid-opener: `<system-rem`. flush() must not emit the half tag.
+    const out = runStream(["here is the answer <system-rem"])
+    expect(out).toBe("here is the answer ")
+    expect(out).not.toContain("system-rem")
+  })
+
+  it("flush drops a stream that ends on a started-but-unterminated opener (<system-reminder attr)", () => {
+    // The full `<system-reminder` literal arrived but its `>` never did.
+    const out = runStream(["done ", '<system-reminder id="x"'])
+    expect(out).toBe("done ")
+    expect(out).not.toContain("system-reminder")
   })
 
   it("emits a trailing partial-open that turns out to be real content", () => {

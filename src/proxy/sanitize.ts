@@ -87,6 +87,17 @@ const SYSTEM_REMINDER_PATTERNS: RegExp[] = [
   /<system-reminder\b[^>]*\/>/gi,
 ]
 
+// Unterminated opener to end-of-string. Applied AFTER the paired/self-closing
+// patterns above strip complete blocks — so any `<system-reminder` that still
+// remains has no matching close. This catches the non-streaming analogue of the
+// streaming flush's drop-on-EOF: an opener whose `>`/`/>` never arrived
+// (`<system-reminder attr`) or a `<system-reminder>CWD…` block that runs to EOF
+// with no `</system-reminder>`. The negative lookahead mirrors findStartedOpener
+// so `<system-reminderX` is not treated as our tag (boundary parity with the
+// streaming path).
+const SYSTEM_REMINDER_UNTERMINATED: RegExp =
+  /<system-reminder(?![A-Za-z0-9_-])[\s\S]*$/i
+
 export interface SanitizeOptions {
   /** Strip `<system-reminder>` blocks. Enable for adapters (Droid) that leak
    *  CWD/env through this tag. */
@@ -144,6 +155,11 @@ export function stripSystemReminderBlocks(text: string): string {
     pattern.lastIndex = 0
     result = result.replace(pattern, "")
   }
+  // After complete blocks are gone, drop any unterminated opener that runs to
+  // EOF so this whole-string path matches the streaming stripper's flush()
+  // behavior (a half-leaked reminder is worse than a truncated message).
+  SYSTEM_REMINDER_UNTERMINATED.lastIndex = 0
+  result = result.replace(SYSTEM_REMINDER_UNTERMINATED, "")
   return result
 }
 
@@ -245,9 +261,18 @@ export class SystemReminderStreamStripper {
       this.inside = false
       return ""
     }
-    // Outside a block, the held-back tail was only a *possible* partial opener
-    // that never materialized — it is real content, emit it.
-    const out = this.buffer
+    // Outside a block: the held-back tail may be a half-written opener that
+    // never finished arriving. If the stream ended on a `<system-reminder`
+    // whose `>`/`/>` never came (findStartedOpener) or on a strict prefix of
+    // the opener (partialOpenLength), drop that suspicious tail — a half-leaked
+    // reminder opener is worse than a truncated message. Anything before it is
+    // real content and is emitted.
+    const startedIdx = findStartedOpener(this.buffer)
+    const safeLen =
+      startedIdx >= 0
+        ? startedIdx
+        : this.buffer.length - partialOpenLength(this.buffer)
+    const out = this.buffer.slice(0, safeLen)
     this.buffer = ""
     return out
   }
