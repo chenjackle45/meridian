@@ -113,3 +113,195 @@ export function sanitizeTextContent(text: string, opts: SanitizeOptions = {}): s
   result = result.replace(/\n{3,}/g, "\n\n")
   return result.trim()
 }
+
+// ---------------------------------------------------------------------------
+// OUTBOUND strip — remove `<system-reminder>…</system-reminder>` from model
+// output before it reaches the client.
+//
+// The inbound sanitizer (above) cleans the prompt we send to the SDK. This is
+// the reverse direction: a defense-in-depth strip on the SDK's response so a
+// reminder block can never leak back to the end user — whether the model
+// echoed one, or one slipped past the inbound strip. Applied unconditionally
+// (NoWayLM's leakage治本); other tags are left untouched.
+// ---------------------------------------------------------------------------
+
+// Longest open-tag prefix we might need to hold back across a streamed delta
+// boundary so a half-written `<system-reminder` opener never leaks. Closing
+// tags are shorter, so this bound covers both.
+const SYSTEM_REMINDER_OPEN = "<system-reminder"
+const SYSTEM_REMINDER_MAX_PARTIAL = SYSTEM_REMINDER_OPEN.length
+
+/**
+ * Strip complete `<system-reminder>…</system-reminder>` blocks (and the
+ * self-closing variant) from a fully-assembled string. Use on the
+ * non-streaming response path. Does not trim or collapse surrounding text —
+ * only the tag spans are removed so the rest of the assistant message is
+ * preserved verbatim.
+ */
+export function stripSystemReminderBlocks(text: string): string {
+  let result = text
+  for (const pattern of SYSTEM_REMINDER_PATTERNS) {
+    pattern.lastIndex = 0
+    result = result.replace(pattern, "")
+  }
+  return result
+}
+
+/**
+ * Stateful, streaming-safe stripper for `<system-reminder>` blocks.
+ *
+ * Feed it text deltas in order via `push()`; it returns the text that is safe
+ * to forward right now (with any reminder spans removed) and internally
+ * buffers:
+ *  - text inside an open (not-yet-closed) reminder block — dropped on close,
+ *  - a short tail that could be the start of a `<system-reminder` opener —
+ *    held back until the next delta disambiguates it.
+ *
+ * Call `flush()` at the end of the block/message to emit any held-back tail.
+ * On flush, an unterminated reminder block (open tag with no close before EOF)
+ * is dropped entirely — a half-leaked reminder is worse than a truncated one.
+ *
+ * One instance per content-block index (reminders never span blocks).
+ */
+export class SystemReminderStreamStripper {
+  // Pending text not yet emitted. Either a possible partial open tag (when
+  // not inside a block) or accumulated content (when inside a block).
+  private buffer = ""
+  // True while between a `<system-reminder…>` open and its `</system-reminder>`.
+  private inside = false
+
+  /** Feed one delta; returns the text safe to forward now. */
+  push(delta: string): string {
+    this.buffer += delta
+    let out = ""
+
+    // Loop because a single delta may contain multiple open/close transitions.
+    // Guard against infinite loops: every branch either returns or shrinks the
+    // problem (consumes part of the buffer / sets a hold-back tail).
+    for (;;) {
+      if (this.inside) {
+        const closeIdx = this.buffer.indexOf("</system-reminder>")
+        if (closeIdx === -1) {
+          // Still inside the block. Drop everything except a possible partial
+          // closing tag at the tail so we can detect the close next delta.
+          this.buffer = keepPartialSuffix(this.buffer, "</system-reminder>")
+          return out
+        }
+        // Found the close — drop the block content and the close tag, continue
+        // scanning the remainder (which is now outside a block).
+        this.buffer = this.buffer.slice(closeIdx + "</system-reminder>".length)
+        this.inside = false
+        continue
+      }
+
+      // Outside a block: look for an opener. Self-closing first (rare).
+      const selfClose = this.buffer.match(/<system-reminder\b[^>]*\/>/i)
+      const open = this.buffer.match(/<system-reminder\b[^>]*>/i)
+
+      // Use whichever real tag appears earliest, if any.
+      const candidates = [selfClose, open].filter(
+        (m): m is RegExpMatchArray => m !== null && m.index !== undefined,
+      )
+      if (candidates.length > 0) {
+        const earliest = candidates.reduce((a, b) =>
+          (a.index! <= b.index! ? a : b),
+        )
+        const idx = earliest.index!
+        // Emit everything before the tag.
+        out += this.buffer.slice(0, idx)
+        if (earliest === selfClose) {
+          // Self-closing: drop the tag, keep scanning after it.
+          this.buffer = this.buffer.slice(idx + earliest[0].length)
+          continue
+        }
+        // Paired open: enter the block, drop the open tag, keep scanning.
+        this.buffer = this.buffer.slice(idx + earliest[0].length)
+        this.inside = true
+        continue
+      }
+
+      // No complete opener yet. Two hold-back cases:
+      //  1. A full `<system-reminder` literal is present but its `>`/`/>` has
+      //     not arrived (attributes still streaming) — hold from that `<`.
+      //  2. The tail is a strict prefix of `<system-reminder` (e.g. ends on
+      //     `<system-rem`) — hold that partial so a half tag never leaks.
+      const startedIdx = findStartedOpener(this.buffer)
+      const holdLen =
+        startedIdx >= 0
+          ? this.buffer.length - startedIdx
+          : partialOpenLength(this.buffer)
+      const safeLen = this.buffer.length - holdLen
+      out += this.buffer.slice(0, safeLen)
+      this.buffer = this.buffer.slice(safeLen)
+      return out
+    }
+  }
+
+  /** Emit any text still safe to forward at end of stream. */
+  flush(): string {
+    if (this.inside) {
+      // Unterminated reminder block — drop it entirely rather than leak.
+      this.buffer = ""
+      this.inside = false
+      return ""
+    }
+    // Outside a block, the held-back tail was only a *possible* partial opener
+    // that never materialized — it is real content, emit it.
+    const out = this.buffer
+    this.buffer = ""
+    return out
+  }
+}
+
+/**
+ * Length of the suffix of `text` that is a strict, non-empty prefix of the
+ * `<system-reminder` opener (and therefore must be held back so a half tag
+ * never leaks). Returns 0 when no such partial exists.
+ */
+/**
+ * Index of a `<system-reminder` literal whose `>` / `/>` terminator has not yet
+ * appeared (the opener is still streaming its attributes). Returns -1 when no
+ * such in-progress opener exists. The whole tail from this index must be held
+ * back so a not-yet-complete reminder tag never leaks.
+ */
+function findStartedOpener(text: string): number {
+  const lower = text.toLowerCase()
+  const idx = lower.lastIndexOf(SYSTEM_REMINDER_OPEN)
+  if (idx === -1) return -1
+  // If the opener already terminated (`>` or `/>`) it would have been matched
+  // as a complete tag earlier — but the boundary char after the literal must
+  // not yet form a terminator. Look for the first `>` after the literal.
+  const afterLiteral = text.slice(idx + SYSTEM_REMINDER_OPEN.length)
+  // A word-boundary guard: `<system-reminderX` is not our tag.
+  if (afterLiteral.length > 0 && /[A-Za-z0-9_-]/.test(afterLiteral[0]!)) return -1
+  if (afterLiteral.includes(">")) return -1 // already complete — handled above
+  return idx
+}
+
+function partialOpenLength(text: string): number {
+  const max = Math.min(SYSTEM_REMINDER_MAX_PARTIAL, text.length)
+  for (let len = max; len > 0; len--) {
+    const suffix = text.slice(text.length - len)
+    if (SYSTEM_REMINDER_OPEN.slice(0, len).toLowerCase() === suffix.toLowerCase()) {
+      return len
+    }
+  }
+  return 0
+}
+
+/**
+ * Keep `text` reduced to only a possible partial-suffix of `marker` at its end
+ * (used while inside a block to retain a half-written closing tag). Everything
+ * that cannot be the start of `marker` is content inside the block and is
+ * dropped.
+ */
+function keepPartialSuffix(text: string, marker: string): string {
+  const max = Math.min(marker.length - 1, text.length)
+  for (let len = max; len > 0; len--) {
+    const suffix = text.slice(text.length - len)
+    if (marker.slice(0, len).toLowerCase() === suffix.toLowerCase()) {
+      return suffix
+    }
+  }
+  return ""
+}

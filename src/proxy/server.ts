@@ -62,7 +62,7 @@ import { filterBetasForProfile, getBetaPolicyFromEnv } from "./betas"
 import { createFileChangeHook, extractFileChangesFromMessages, formatFileChangeSummary, type FileChange } from "./fileChanges"
 import { detectTokenAnomalies, formatAnomalyAlerts, type TokenSnapshot } from "./tokenHealth"
 import { computeCacheHitRate, formatUsageSummary } from "./tokenUsage"
-import { sanitizeTextContent } from "./sanitize"
+import { sanitizeTextContent, stripSystemReminderBlocks, SystemReminderStreamStripper } from "./sanitize"
 import {
   computeLineageHash,
   hashMessage,
@@ -1210,6 +1210,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                     if (passthrough && b.type === "tool_use" && typeof b.name === "string") {
                       b.name = stripMcpPrefix(b.name as string)
                     }
+                    // Outbound defense-in-depth: never let a <system-reminder>
+                    // block leak back to the client in a text block (see M1).
+                    if (b.type === "text" && typeof b.text === "string") {
+                      b.text = stripSystemReminderBlocks(b.text as string)
+                    }
                     contentBlocks.push(b)
                   }
                 }
@@ -1670,6 +1675,17 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
               // the key-value pair may span multiple deltas, preventing regex match.
               const taskToolBlockIndices = new Set<number>()
               const taskToolJsonBuffer = new Map<number, string>()
+              // Outbound <system-reminder> strip, one stateful stripper per
+              // content-block index (reminders never span blocks). See M1 /
+              // SystemReminderStreamStripper — buffers across deltas so a tag
+              // split mid-stream (or a half-written opener at a delta boundary)
+              // never leaks to the client.
+              const reminderStrippers = new Map<number, SystemReminderStreamStripper>()
+              const getReminderStripper = (idx: number): SystemReminderStreamStripper => {
+                let s = reminderStrippers.get(idx)
+                if (!s) { s = new SystemReminderStreamStripper(); reminderStrippers.set(idx, s) }
+                return s
+              }
 
               // Block index remapping: the SDK resets indices on each turn, but
               // we skip intermediate message_start/stop so the client sees one
@@ -1859,6 +1875,39 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}): ProxyServe
                           taskToolJsonBuffer.delete(eventIndex)
                         }
                         // Fall through to forward content_block_stop normally
+                      }
+                    }
+
+                    // Outbound <system-reminder> strip (M1). Run text deltas
+                    // through the per-index stripper; on block stop, flush any
+                    // held-back tail as a trailing text_delta before the stop.
+                    if (eventType === "content_block_delta" && eventIndex !== undefined) {
+                      const delta = (event as any).delta
+                      if (delta?.type === "text_delta" && typeof delta.text === "string") {
+                        const cleaned = getReminderStripper(eventIndex).push(delta.text)
+                        if (cleaned.length === 0) {
+                          // Entire delta was buffered/stripped — emit nothing.
+                          continue
+                        }
+                        delta.text = cleaned
+                      }
+                    }
+                    if (eventType === "content_block_stop" && eventIndex !== undefined) {
+                      const stripper = reminderStrippers.get(eventIndex)
+                      if (stripper) {
+                        const tail = stripper.flush()
+                        reminderStrippers.delete(eventIndex)
+                        if (tail.length > 0) {
+                          const clientIdx = sdkToClientIndex.get(eventIndex) ?? eventIndex
+                          safeEnqueue(encoder.encode(
+                            `event: content_block_delta\ndata: ${JSON.stringify({
+                              type: "content_block_delta",
+                              index: clientIdx,
+                              delta: { type: "text_delta", text: tail },
+                            })}\n\n`
+                          ), "reminder_flush_delta")
+                          textEventsForwarded += 1
+                        }
                       }
                     }
 
