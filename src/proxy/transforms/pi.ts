@@ -33,6 +33,13 @@ export const piTransforms: Transform[] = [
         allowedMcpTools: PI_ALLOWED_MCP_TOOLS,
         sdkAgents: {},
         supportsThinking: true,
+        // NoWayLM's OpenClaw runtime drives the pi adapter and injects
+        // `<system-reminder>` blocks carrying the host CWD / orchestration
+        // context. Strip them from inbound history before flattening so they
+        // don't echo back to the model (replay pollution). Same mechanism as
+        // Droid — the flag name is about CWD leakage, which is exactly what
+        // these reminders carry here.
+        leaksCwdViaSystemReminder: true,
         extractFileChangesFromToolUse,
       }
     },
