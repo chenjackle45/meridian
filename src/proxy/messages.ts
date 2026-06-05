@@ -82,6 +82,42 @@ export function getLastUserMessage(messages: Array<{ role: string; content: any 
 }
 
 /**
+ * Extract the last contiguous run of user messages (the current user "turn").
+ *
+ * Unlike getLastUserMessage (single last user message), this returns ALL
+ * trailing consecutive user messages. The pi/OpenClaw client emits one logical
+ * turn as TWO adjacent user messages — the content message FOLLOWED BY a
+ * trailing "Sender (untrusted metadata)" block. getLastUserMessage would return
+ * only that trailing metadata block, dropping the user's actual question and
+ * leaving the model with metadata-only input (→ empty / NO_REPLY turn).
+ * Returning the whole trailing user run keeps the real content in the delta.
+ *
+ * Trade-off vs #171 (identical-array continuation): when the last turn happens
+ * to be multiple user messages the SDK already holds, this re-sends the whole
+ * run rather than a single message. Accepted: every real resume here carries a
+ * fresh user turn (length > cached count → modified continuation), so the
+ * "nothing new" identical-array path does not reach this fallback in the pi
+ * adapter; and forwarding a metadata tail is far cheaper than swallowing the
+ * user's question.
+ */
+export function getLastUserTurn(messages: Array<{ role: string; content: any }>): Array<{ role: string; content: any }> {
+  const userIdx = lastUserIndex(messages)
+  if (userIdx < 0) return messages.slice(-1)
+  return messages.slice(lastUserTurnStart(messages, userIdx), userIdx + 1)
+}
+
+/**
+ * Index of the first message in the last contiguous run of user messages
+ * ending at `userIdx`. Walks backward while the prior message is also a user
+ * message. Used to keep a double-user turn (content + trailing metadata) whole.
+ */
+function lastUserTurnStart(messages: Array<{ role: string; content: any }>, userIdx: number): number {
+  let start = userIdx
+  while (start > 0 && messages[start - 1]?.role === "user") start--
+  return start
+}
+
+/**
  * Return the index of the last user message, or -1 if none.
  */
 function lastUserIndex(messages: Array<{ role: string; content: any }>): number {
@@ -131,23 +167,30 @@ export function selectResumeDelta(
   const userIdx = lastUserIndex(allMessages)
 
   // No user message at all (degenerate) — fall back to the legacy behavior.
-  if (userIdx < 0) return getLastUserMessage(allMessages)
+  if (userIdx < 0) return getLastUserTurn(allMessages)
 
   if (knownCount > 0 && knownCount < allMessages.length) {
     // Sentinel: the slice start must sit at or before the current last user
     // message. If knownCount drifted past it, the slice would omit the user's
-    // question — fall back to forwarding just the last user message so the
-    // model always sees the current turn.
+    // question — fall back to forwarding the last user turn so the model
+    // always sees the current turn (content + any trailing metadata).
     if (knownCount <= userIdx) {
       // Drop leading prior-assistant messages the SDK already has (start the
       // delta at the first new user message), and truncate any trailing
       // non-user scaffold after the last user turn (end at userIdx + 1).
       let start = knownCount
       while (start < userIdx && allMessages[start]?.role !== "user") start++
+      // If knownCount landed INSIDE the last contiguous user run (e.g. pointing
+      // at the trailing "Sender (untrusted metadata)" message of a pi double-user
+      // turn), pull start back to the run's first message so the real question
+      // is never sliced off. Earlier new user turns (separated by an assistant)
+      // are unaffected — turnStart only rewinds within the final user run.
+      const turnStart = lastUserTurnStart(allMessages, userIdx)
+      if (start > turnStart) start = turnStart
       return allMessages.slice(start, userIdx + 1)
     }
-    return getLastUserMessage(allMessages)
+    return getLastUserTurn(allMessages)
   }
 
-  return getLastUserMessage(allMessages)
+  return getLastUserTurn(allMessages)
 }

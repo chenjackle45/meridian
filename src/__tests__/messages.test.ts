@@ -2,7 +2,7 @@
  * Unit tests for message parsing utilities.
  */
 import { describe, it, expect } from "bun:test"
-import { normalizeContent, getLastUserMessage, selectResumeDelta, extractAdvisorModel, stripAdvisorTools } from "../proxy/messages"
+import { normalizeContent, getLastUserMessage, getLastUserTurn, selectResumeDelta, extractAdvisorModel, stripAdvisorTools } from "../proxy/messages"
 
 describe("normalizeContent", () => {
   it("returns string content as-is", () => {
@@ -209,6 +209,58 @@ describe("selectResumeDelta", () => {
     expect(delta.filter((m) => m.role === "user").map((m) => m.content)).toEqual(["q1", "q2"])
     expect(delta[0]!.role).toBe("user")
     expect(delta[delta.length - 1]!.role).toBe("user")
+  })
+
+  // --- REGRESSION: pi/OpenClaw double-user turn (content + trailing metadata) ---
+  // wire-confirmed (2026-06-06): each turn arrives as [..., user(content),
+  // user(metadata)] and verifyLineage's modified-continuation self-mutates
+  // messageCount to messages.length, so selectResumeDelta receives
+  // knownCount === length. The OLD getLastUserMessage fallback returned ONLY
+  // the trailing "Sender (untrusted metadata)" block, dropping the question →
+  // model saw metadata-only → NO_REPLY. getLastUserTurn must keep BOTH.
+
+  it("REGRESSION: keeps the content message when a trailing metadata user follows it (knownCount==length)", () => {
+    const msgs = [u("q0"), a("a0"), u("BETA 是多少?"), u("Sender (untrusted metadata)")]
+    const delta = selectResumeDelta(msgs, 4)
+    expect(delta.filter((m) => m.role === "user").map((m) => m.content)).toEqual(["BETA 是多少?", "Sender (untrusted metadata)"])
+    expect(delta.some((m) => m.content === "BETA 是多少?")).toBe(true)
+  })
+
+  it("REGRESSION: double-user turn recovered when knownCount drifts past the last user", () => {
+    const msgs = [u("q0"), a("a0"), u("content"), u("metadata"), a("a1")]
+    const delta = selectResumeDelta(msgs, 5)
+    expect(delta.filter((m) => m.role === "user").map((m) => m.content)).toEqual(["content", "metadata"])
+  })
+
+  it("REGRESSION (codex P2): normal slice branch keeps content when knownCount lands INSIDE the user run", () => {
+    // knownCount points at the trailing metadata message (last user), so
+    // knownCount <= userIdx takes the SLICE branch, NOT the fallback. The naive
+    // slice returned only [metadata]; turnStart must rewind to the content msg.
+    const msgs = [u("q0"), a("a0"), u("BETA 是多少?"), u("Sender (untrusted metadata)")]
+    const delta = selectResumeDelta(msgs, 3)
+    expect(delta.filter((m) => m.role === "user").map((m) => m.content)).toEqual(["BETA 是多少?", "Sender (untrusted metadata)"])
+    expect(delta.some((m) => m.content === "BETA 是多少?")).toBe(true)
+  })
+})
+
+describe("getLastUserTurn", () => {
+  const u = (c: string) => ({ role: "user", content: c })
+  const a = (c: string) => ({ role: "assistant", content: [{ type: "text", text: c }] })
+
+  it("returns all trailing consecutive user messages", () => {
+    expect(getLastUserTurn([u("q0"), a("a0"), u("c1"), u("c2")]).map((m) => m.content)).toEqual(["c1", "c2"])
+  })
+
+  it("returns the single trailing user when only one", () => {
+    expect(getLastUserTurn([u("q0"), a("a0"), u("c")]).map((m) => m.content)).toEqual(["c"])
+  })
+
+  it("stops at the non-user boundary (earlier user run excluded)", () => {
+    expect(getLastUserTurn([u("c1"), u("c2"), a("x"), u("c3")]).map((m) => m.content)).toEqual(["c3"])
+  })
+
+  it("degenerates to the last message when there is no user", () => {
+    expect(getLastUserTurn([a("x"), a("y")]).map((m) => m.role)).toEqual(["assistant"])
   })
 })
 
