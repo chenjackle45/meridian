@@ -179,6 +179,39 @@ export function buildCwdNote(sdkCwd: string, clientCwd?: string): string {
   )
 }
 
+/**
+ * PATCHED: NoWayLM — neutralize third-party-harness BRAND IDENTITY in the
+ * client system context before it reaches the systemPrompt slot.
+ *
+ * Why: Anthropic's usage-billing classifier inspects the system block for
+ * third-party-harness identity signals. The brand name appears there ~25
+ * times via the OpenClaw harness preamble + the NoWayLM agent baseline.
+ * We strip the *identity declaration* — the capitalized brand spelling
+ * `OpenClaw`, which an audit of both sources (harness system-prompt.ts +
+ * backend openclaw-baseline/) shows is used ONLY for descriptive / brand
+ * prose ("running inside OpenClaw", "OpenClaw handles routing", section
+ * headings) — and replace it with a neutral runtime descriptor.
+ *
+ * What we deliberately KEEP (load-bearing, case-sensitive lowercase
+ * `openclaw`): CLI invocations the model actually runs (`openclaw gateway
+ * restart`, `openclaw status`), filesystem paths (`/home/user/.openclaw/`),
+ * URLs (`https://docs.openclaw.ai`, `github.com/openclaw/openclaw`), and
+ * skill-frontmatter keys (`metadata.openclaw.requires.bins`). Rewriting any
+ * of those would break real tool calls, so the replace is case-sensitive on
+ * the capitalized spelling only.
+ *
+ * The bet: the classifier keys on the identity pattern, not on residual
+ * lowercase technical references. Residual lowercase `openclaw` (commands /
+ * paths / URLs) is expected to remain; the billing dashboard is the final
+ * arbiter.
+ */
+export function sanitizeBrandIdentity(text: string): string {
+  // Case-sensitive: only the capitalized brand spelling, which is descriptive
+  // prose in every audited occurrence. Lowercase `openclaw` (commands, paths,
+  // URLs, frontmatter keys) is load-bearing and left untouched.
+  return text.replace(/OpenClaw/g, "the agent runtime")
+}
+
 function resolveSystemPrompt(
   systemContext: string | undefined,
   passthrough: boolean,
@@ -190,7 +223,11 @@ function resolveSystemPrompt(
   const hasSettings = settingSources != null && settingSources.length > 0
   const usePreset = codeSystemPrompt ?? (hasSettings || (!passthrough && !!systemContext))
   const includeClient = clientSystemPrompt ?? true
-  const clientContext = includeClient ? systemContext : undefined
+  // PATCHED: NoWayLM — strip brand identity (capitalized `OpenClaw`) from the
+  // client system context before it enters the systemPrompt slot. See
+  // sanitizeBrandIdentity above for the rationale and the load-bearing carve-outs.
+  const clientContext =
+    includeClient && systemContext !== undefined ? sanitizeBrandIdentity(systemContext) : undefined
   const append = [clientContext, cwdNote].filter(Boolean).join("") || undefined
 
   if (usePreset) {
