@@ -15,9 +15,22 @@
  */
 
 import { execFile as execFileCb } from "child_process"
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs"
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  unlinkSync,
+  writeSync,
+} from "fs"
 import { homedir, platform, userInfo } from "os"
-import { join, dirname, resolve } from "path"
+import { basename, join, dirname, resolve } from "path"
 import { createHash } from "crypto"
 import { promisify } from "util"
 import { claudeLog } from "../logger"
@@ -55,6 +68,9 @@ interface OAuthCredentials {
   accessToken: string
   refreshToken: string
   expiresAt: number
+  // PATCHED: NoWayLM — rotation 附帶的 refresh chain 效期；不跟著展延會凍在
+  // provisioning 當下，host verify gate 會在舊效期到點時誤判登入鏈自然到期。
+  refreshTokenExpiresAt?: number
   scopes?: string[]
   subscriptionType?: string
   rateLimitTier?: string
@@ -72,6 +88,8 @@ interface CredentialsFile {
 export interface CredentialStore {
   read(): Promise<CredentialsFile | null>
   write(credentials: CredentialsFile): Promise<boolean>
+  /** PATCHED: NoWayLM — file-backed store 暴露路徑，refresh 據此對 host 共用 lock 上鎖。 */
+  readonly credentialFilePath?: string
 }
 
 /**
@@ -86,6 +104,140 @@ export interface CredentialStore {
  */
 export function serializeCredentials(credentials: CredentialsFile): string {
   return JSON.stringify(credentials)
+}
+
+// ---------------------------------------------------------------------------
+// PATCHED: NoWayLM — cross-process credential lock + realpath-aware atomic write
+//
+// 所有 NoWayLM / Whisk container 與 host keepwarm / 顯式 provisioning 共用同一份
+// rw bind mount 的 rotating refresh token。refresh 為單次輪替：兩個 writer 拿同一顆
+// refresh token 同時打 OAuth endpoint，後到者 invalid_grant、甚至把 stale 內容寫回
+// 蓋掉 successor → chain 燒毀、只能全站停機人工 re-provision。因此：
+//   1. 消耗 refresh token 前必須取得 credentials「真實路徑」目錄下的 `.keepwarm.lock`
+//      （mkdir 原子鎖；與 host scripts 同名、同 primitive、同 inode — 容器內
+//      ~/.claude/.credentials.json 是 symlink 到 /app/claude-creds/，鎖必須跟著
+//      realpath 走才能跨 container / host 互斥）。
+//   2. 取鎖後重讀：別的 writer 已完成 rotation 就直接採用 successor、不再打 API。
+//   3. 等鎖逾時「不偷鎖」（對齊 host 政策：orphan lock 只走 runbook §4.7 人工盤點）；
+//      逾時後讀到 successor 仍採用，否則放棄本輪、交背景排程稍後重試。
+//   4. 檔案寫入改 tmp + fsync + rename 到 realpath（直接 rename 到 symlink 路徑會把
+//      symlink 換成 container-local 檔案，host 永遠看不到 successor）。
+// ---------------------------------------------------------------------------
+
+const CREDENTIAL_LOCK_DIR_NAME = ".keepwarm.lock"
+const CREDENTIAL_LOCK_WAIT_MS = 15_000
+const CREDENTIAL_LOCK_POLL_MS = 500
+
+/** Resolve symlinks so lock + atomic rename land on the real (host-shared) file. */
+function resolveCredentialTargetPath(filePath: string): string {
+  try {
+    return realpathSync(filePath)
+  } catch {
+    try {
+      return join(realpathSync(dirname(filePath)), basename(filePath))
+    } catch {
+      return resolve(filePath)
+    }
+  }
+}
+
+function credentialLockDirPathFor(filePath: string): string {
+  return join(dirname(resolveCredentialTargetPath(filePath)), CREDENTIAL_LOCK_DIR_NAME)
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms))
+}
+
+async function acquireCredentialLock(lockDirPath: string, maxWaitMs: number): Promise<boolean> {
+  const deadline = Date.now() + maxWaitMs
+  for (;;) {
+    try {
+      mkdirSync(lockDirPath)
+      return true
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        claudeLog("token_refresh.lock_error", { lockDirPath, error: String(err) })
+        return false
+      }
+    }
+    if (Date.now() >= deadline) return false
+    await sleep(CREDENTIAL_LOCK_POLL_MS)
+  }
+}
+
+function releaseCredentialLock(lockDirPath: string): void {
+  try {
+    rmdirSync(lockDirPath)
+  } catch (err) {
+    // 放鎖失敗不可吞掉不記：orphan 會擋 host keepwarm；log 供 runbook §4.7 盤點。
+    claudeLog("token_refresh.lock_release_failed", { lockDirPath, error: String(err) })
+  }
+}
+
+function buildCredentialTempName(): string {
+  return `.credentials.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 8)}`
+}
+
+// refresh token 是單次輪替：POST 成功後任何持久化失敗都會讓 successor 只存在記憶體。
+// 因此 temp 建立、權限、64KiB 空間預留、fsync 全部移到 POST 之前完成；POST 之後只剩
+// 「覆寫已預留的 fd + rename」這種幾乎不會失敗的步驟。
+const CREDENTIAL_TEMP_RESERVE_BYTES = 64 * 1024
+
+function prepareCredentialTemp(targetPath: string): { fd: number; path: string } {
+  const temporaryPath = join(dirname(targetPath), buildCredentialTempName())
+  const fd = openSync(temporaryPath, "wx", 0o600)
+  try {
+    writeBufferFully(fd, Buffer.alloc(CREDENTIAL_TEMP_RESERVE_BYTES, 0x20), 0)
+    fsyncSync(fd)
+    return { fd, path: temporaryPath }
+  } catch (err) {
+    try {
+      closeSync(fd)
+    } catch {}
+    try {
+      unlinkSync(temporaryPath)
+    } catch {}
+    throw err
+  }
+}
+
+function writeBufferFully(fd: number, buffer: Buffer, filePosition: number): void {
+  let offset = 0
+  while (offset < buffer.length) {
+    const written = writeSync(fd, buffer, offset, buffer.length - offset, filePosition + offset)
+    if (written <= 0) throw new Error("short write while persisting credentials")
+    offset += written
+  }
+}
+
+/** 把 serialized credentials 落到已預留的 temp fd 並 rename 到 target（含 parent dir fsync）。 */
+function commitSerializedCredentials(fd: number, temporaryPath: string, targetPath: string, serialized: string): void {
+  const payload = Buffer.from(serialized, "utf-8")
+  if (payload.length > CREDENTIAL_TEMP_RESERVE_BYTES) {
+    // 超過預留空間的寫入會重新引入 post-POST ENOSPC 面；credentials 正常 ~2KiB，
+    // 超過 64KiB 一定是異常 payload，直接走 commit 失敗（fail-closed）。
+    throw new Error("serialized credentials exceed reserved temp capacity")
+  }
+  writeBufferFully(fd, payload, 0)
+  try {
+    // truncate 失敗不 abort：JSON.parse 容忍 trailing whitespace（對齊 host keepwarm）。
+    ftruncateSync(fd, payload.length)
+  } catch {}
+  fsyncSync(fd)
+  closeSync(fd)
+  renameSync(temporaryPath, targetPath)
+  try {
+    const directoryFd = openSync(dirname(targetPath), "r")
+    try {
+      fsyncSync(directoryFd)
+    } finally {
+      closeSync(directoryFd)
+    }
+  } catch (err) {
+    // parent dir fsync 失敗只降 durability（crash 才可能回退），rename 本身已成功。
+    claudeLog("token_refresh.dir_fsync_failed", { targetPath, error: String(err) })
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -173,21 +325,48 @@ function buildFileStore(filePath: string): CredentialStore {
     },
 
     async write(credentials) {
+      // PATCHED: NoWayLM — tmp + fsync + rename 到 realpath；0600（host read-only gate 要求）。
+      // refresh transaction（doRefresh）不走這條：它用 pre-POST 預建的 temp 走
+      // commitCredentialsToTarget，把可失敗步驟移到 refresh token 被消耗之前。
+      let temporaryPath: string | null = null
+      let temporaryFd: number | null = null
       try {
         // Ensure parent dir exists for non-default paths.
         mkdirSync(dirname(filePath), { recursive: true })
-        writeFileSync(filePath, serializeCredentials(credentials), "utf-8")
+        const targetPath = resolveCredentialTargetPath(filePath)
+        temporaryPath = join(dirname(targetPath), buildCredentialTempName())
+        temporaryFd = openSync(temporaryPath, "wx", 0o600)
+        commitSerializedCredentials(temporaryFd, temporaryPath, targetPath, serializeCredentials(credentials))
+        temporaryFd = null
+        temporaryPath = null
         return true
       } catch (err) {
         claudeLog("token_refresh.file_write_failed", { path: filePath, error: String(err) })
+        if (temporaryFd !== null) {
+          try {
+            closeSync(temporaryFd)
+          } catch {}
+        }
+        if (temporaryPath) {
+          try {
+            unlinkSync(temporaryPath)
+          } catch {}
+        }
         return false
       }
     },
+
+    credentialFilePath: filePath,
   }
 }
 
 
 const fileStore: CredentialStore = buildFileStore(CREDENTIALS_FILE)
+
+/** PATCHED: NoWayLM — 測試跨 process lock 行為用（production 一律走 createPlatformCredentialStore）。 */
+export function createFileCredentialStore(filePath: string): CredentialStore {
+  return buildFileStore(filePath)
+}
 
 /**
  * Returns the appropriate credential store for the current platform.
@@ -230,17 +409,40 @@ let inflightRefresh: Promise<boolean> | null = null
  *
  * @param store  Override the credential store (for testing).
  */
-export async function refreshOAuthToken(store?: CredentialStore): Promise<boolean> {
+export async function refreshOAuthToken(
+  store?: CredentialStore,
+  lockWaitMs = CREDENTIAL_LOCK_WAIT_MS,
+): Promise<boolean> {
   if (inflightRefresh) return inflightRefresh
 
-  inflightRefresh = doRefresh(store ?? createPlatformCredentialStore()).finally(() => {
+  inflightRefresh = doRefresh(store ?? createPlatformCredentialStore(), lockWaitMs).finally(() => {
     inflightRefresh = null
   })
 
   return inflightRefresh
 }
 
-async function doRefresh(store: CredentialStore): Promise<boolean> {
+// PATCHED: NoWayLM — 判斷「等待期間別的 writer 是否已完成 refresh」：refresh token 已
+// 輪替、或 access token 效期前移，都代表 successor 已落地、本輪不得再消耗舊 token。
+//
+// 已知限制（審查拍板接受）：這是 heuristic、無 lineage 證明。若 operator 違反 runbook
+// 「禁止憑 backup 還原」把舊備份蓋回 live 檔，本函式會把它誤認 successor 而回報成功；
+// 但那個還原動作本身已經毀鏈（live successor 被覆蓋消失），本函式只影響發現時point、
+// 不是成因。writer 集合封閉（同機 keepwarm / Meridian / provisioning、共用時鐘），
+// 引入 generation/receipt 協議需同步改兩 repo 全部 writer，超出規模效益。
+function wasRefreshedByOtherWriter(before: CredentialsFile, after: CredentialsFile): boolean {
+  const beforeOauth = before.claudeAiOauth
+  const afterOauth = after.claudeAiOauth
+  if (!afterOauth?.accessToken || !afterOauth.refreshToken) return false
+  if (afterOauth.refreshToken !== beforeOauth.refreshToken) return true
+  return (
+    typeof afterOauth.expiresAt === "number" &&
+    typeof beforeOauth.expiresAt === "number" &&
+    afterOauth.expiresAt > beforeOauth.expiresAt
+  )
+}
+
+async function doRefresh(store: CredentialStore, lockWaitMs: number): Promise<boolean> {
   const credentials = await store.read()
   if (!credentials) {
     claudeLog("token_refresh.no_credentials", {})
@@ -251,6 +453,133 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
   if (!refreshToken) {
     claudeLog("token_refresh.no_refresh_token", {})
     return false
+  }
+
+  // PATCHED: NoWayLM — file-backed store 必須先取得 host 共用 .keepwarm.lock 才可
+  // 消耗 rotating refresh token；keychain / 注入的測試 store 沒有共用檔案，維持原行為。
+  // target realpath 在此解析一次並「釘住」整個 transaction：鎖、重讀、temp、rename
+  // 全部用同一路徑，杜絕鎖住舊目錄卻寫新目錄的 divergence。
+  const pinnedTargetPath = store.credentialFilePath
+    ? resolveCredentialTargetPath(store.credentialFilePath)
+    : null
+  const lockDirPath = pinnedTargetPath
+    ? join(dirname(pinnedTargetPath), CREDENTIAL_LOCK_DIR_NAME)
+    : null
+  if (!lockDirPath || !pinnedTargetPath) {
+    // 已知限制（審查拍板接受）：keychain / 無檔案路徑 backend 沒有跨 process lock 可保留，
+    // possibly-consumed 保護僅止於 process-local；此路徑只在「Meridian 直接跑於 macOS host」
+    // 時存在（NoWayLM production 恆為 Linux 容器 file store），行為與 upstream 原生一致。
+    return (await performRefresh(store, credentials, null)).ok
+  }
+
+  if (!(await acquireCredentialLock(lockDirPath, lockWaitMs))) {
+    // 不偷鎖：逾時後若別的 writer 已寫入 successor 就直接採用，否則放棄本輪
+    //（背景排程 failureRetryMs 後重試），orphan lock 留給 runbook §4.7 人工盤點。
+    const latest = await store.read()
+    if (latest && wasRefreshedByOtherWriter(credentials, latest)) {
+      claudeLog("token_refresh.adopted_external_refresh", { lockDirPath, afterLockTimeout: true })
+      return true
+    }
+    claudeLog("token_refresh.lock_busy", { lockDirPath })
+    return false
+  }
+  let retainLockForQuarantine = false
+  try {
+    // 取鎖後重解析 target：等鎖期間 symlink 被 retarget（如 re-provision 換佈局）
+    // 代表鎖與目標已 divergence，放鎖退出、絕不消耗 refresh token。
+    if (resolveCredentialTargetPath(store.credentialFilePath!) !== pinnedTargetPath) {
+      claudeLog("token_refresh.target_retargeted", { pinnedTargetPath })
+      return false
+    }
+    // 鎖內重讀「直接讀 pinned realpath」：不經 store（symlink 可變），使 compare 之後
+    // 的 retarget 結構性無效 — 之後的讀 / temp / rename 全都只碰 pinned path。
+    let current: CredentialsFile | null = null
+    try {
+      current = JSON.parse(readFileSync(pinnedTargetPath, "utf-8")) as CredentialsFile
+    } catch (err) {
+      claudeLog("token_refresh.pinned_read_failed", { pinnedTargetPath, error: String(err) })
+      return false
+    }
+    if (!current?.claudeAiOauth?.refreshToken) {
+      claudeLog("token_refresh.no_refresh_token", { afterLock: true })
+      return false
+    }
+    if (wasRefreshedByOtherWriter(credentials, current)) {
+      claudeLog("token_refresh.adopted_external_refresh", { lockDirPath })
+      return true
+    }
+    const result = await performRefresh(store, current, pinnedTargetPath)
+    retainLockForQuarantine = result.retainLock
+    if (result.retainLock) {
+      writeRefreshIncidentMarker(pinnedTargetPath, result.retainReason ?? "unknown")
+    }
+    return result.ok
+  } finally {
+    if (retainLockForQuarantine) {
+      // rotation 已成功但 successor 落盤失敗：舊 token 已死、繼續讓其他 writer 重試
+      // 只會空燒。保留 lock 讓 host keepwarm 的 orphan 告警把 operator 拉進 runbook。
+      claudeLog("token_refresh.lock_retained_for_quarantine", { lockDirPath })
+    } else {
+      releaseCredentialLock(lockDirPath)
+    }
+  }
+}
+
+interface RefreshOutcome {
+  ok: boolean
+  /** rotation 成功但持久化失敗 — caller 必須保留 lock（fail-closed quarantine）。 */
+  retainLock: boolean
+  /** retainLock=true 時的事故原因（寫進 incident marker，不含任何 token）。 */
+  retainReason?: string
+}
+
+// 事故訊號不能只靠 claudeLog（debug-only、需 env 才輸出）：retainLock 時在 credentials
+// 目錄寫一顆不含 token 的 incident marker，operator 依 runbook §4.7 盤點 lock 時可直接
+// grep 到原因，不會誤判成一般 orphan。best-effort：寫不進去仍以 retained lock 為主訊號。
+function writeRefreshIncidentMarker(pinnedTargetPath: string, reason: string): void {
+  try {
+    const markerPath = join(dirname(pinnedTargetPath), `.credentials.refresh-incident.${Date.now()}`)
+    const fd = openSync(markerPath, "wx", 0o600)
+    try {
+      writeBufferFully(fd, Buffer.from(`${new Date().toISOString()}|${reason}\n`, "utf-8"), 0)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    claudeLog("token_refresh.incident_marker_written", { markerPath, reason })
+  } catch (err) {
+    claudeLog("token_refresh.incident_marker_failed", { reason, error: String(err) })
+  }
+}
+
+async function performRefresh(
+  store: CredentialStore,
+  credentials: CredentialsFile,
+  pinnedTargetPath: string | null,
+): Promise<RefreshOutcome> {
+  const { refreshToken } = credentials.claudeAiOauth
+
+  // PATCHED: NoWayLM — POST 會消耗一次性 refresh token；所有「可預防的失敗」（temp
+  // 建立、權限、空間預留、fsync）都移到 POST 之前，失敗時 token 尚未消耗、安全退出。
+  let preparedTemp: { fd: number; path: string } | null = null
+  if (pinnedTargetPath) {
+    try {
+      mkdirSync(dirname(pinnedTargetPath), { recursive: true })
+      preparedTemp = prepareCredentialTemp(pinnedTargetPath)
+    } catch (err) {
+      claudeLog("token_refresh.write_preflight_failed", { pinnedTargetPath, error: String(err) })
+      return { ok: false, retainLock: false }
+    }
+  }
+  const discardPreparedTemp = (): void => {
+    if (!preparedTemp) return
+    try {
+      closeSync(preparedTemp.fd)
+    } catch {}
+    try {
+      unlinkSync(preparedTemp.path)
+    } catch {}
+    preparedTemp = null
   }
 
   let response: Response
@@ -266,22 +595,35 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
       signal: AbortSignal.timeout(15_000),
     })
   } catch (err) {
+    discardPreparedTemp()
     claudeLog("token_refresh.request_failed", { error: String(err) })
-    return false
+    return { ok: false, retainLock: false }
   }
 
   if (!response.ok) {
     const body = await response.text().catch(() => "")
+    discardPreparedTemp()
     claudeLog("token_refresh.bad_response", { status: response.status, body })
-    return false
+    return { ok: false, retainLock: false }
   }
 
-  let tokenData: { access_token: string; refresh_token?: string; expires_in?: number; expires_at?: number }
+  let tokenData: {
+    access_token: string
+    refresh_token?: string
+    expires_in?: number
+    expires_at?: number
+    refresh_token_expires_in?: number
+  }
   try {
     tokenData = await response.json() as typeof tokenData
   } catch (err) {
-    claudeLog("token_refresh.parse_failed", { error: String(err) })
-    return false
+    // HTTP 2xx 代表 server 已處理請求 — rotation 極可能已發生、successor 只存在於
+    // 這個解析不了的 body 裡（已不可救）。fail-closed：保留 lock，避免任何 writer
+    // 拿已消耗的 predecessor 重試（reuse 偵測可能連坐 revoke），讓 host keepwarm
+    // orphan 告警把 operator 拉進 runbook。
+    discardPreparedTemp()
+    claudeLog("token_refresh.response_unparseable_possibly_consumed", { error: String(err) })
+    return { ok: false, retainLock: true, retainReason: "response-unparseable-possibly-consumed" }
   }
 
   const now = Date.now()
@@ -296,11 +638,53 @@ async function doRefresh(store: CredentialStore): Promise<boolean> {
     expiresAt,
   }
 
-  const written = await store.write(credentials)
-  if (!written) return false
+  // PATCHED: NoWayLM — rotation 附帶 refresh chain 新效期就一併展延（對齊 host keepwarm）；
+  // 不展延會凍在 provisioning 當下、host verify gate 會提前 fail-closed 逼全站 re-provision。
+  if (
+    tokenData.refresh_token &&
+    typeof tokenData.refresh_token_expires_in === "number" &&
+    tokenData.refresh_token_expires_in > 0
+  ) {
+    credentials.claudeAiOauth.refreshTokenExpiresAt = now + tokenData.refresh_token_expires_in * 1000
+  }
+
+  if (!pinnedTargetPath || !preparedTemp) {
+    // keychain / 無檔案路徑：沿用 store 自己的寫入。
+    const written = await store.write(credentials)
+    if (!written) return { ok: false, retainLock: false }
+    claudeLog("token_refresh.success", { expiresAt })
+    return { ok: true, retainLock: false }
+  }
+
+  const committingTemp = preparedTemp
+  try {
+    commitSerializedCredentials(
+      committingTemp.fd,
+      committingTemp.path,
+      pinnedTargetPath,
+      serializeCredentials(credentials),
+    )
+    preparedTemp = null
+  } catch (err) {
+    // rotation 已成功、successor 落盤失敗：舊 token 已被 server 作廢。temp 檔在失敗
+    // 當下極可能已含完整 successor（write+fsync 先於 rename）—— 它就是唯一救援
+    // artifact，「絕不刪除」，只關 fd、把路徑寫進 log；並要求 caller 保留 lock
+    //（fail-closed；host keepwarm orphan 告警把 operator 拉進 runbook §4.7 的
+    // successor-recovery 流程：驗 temp JSON → 手動轉正 → rmdir lock）。
+    claudeLog("token_refresh.successor_persist_failed", {
+      pinnedTargetPath,
+      retainedTempPath: committingTemp.path,
+      error: String(err),
+    })
+    try {
+      closeSync(committingTemp.fd)
+    } catch {}
+    preparedTemp = null
+    return { ok: false, retainLock: true, retainReason: "successor-persist-failed-temp-retained" }
+  }
 
   claudeLog("token_refresh.success", { expiresAt })
-  return true
+  return { ok: true, retainLock: false }
 }
 
 /**
