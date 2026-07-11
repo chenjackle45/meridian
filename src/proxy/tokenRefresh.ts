@@ -472,6 +472,13 @@ async function doRefresh(store: CredentialStore, lockWaitMs: number): Promise<bo
     return (await performRefresh(store, credentials, null)).ok
   }
 
+  // 便宜加固：host 顯式 provisioning 兩階段之間若 SOP 違規（容器沒停乾淨），Meridian
+  // 不得在 pending gate 存在時 rotate（會讓 keepwarm proof hash-mismatch、gate 卡死）。
+  if (existsSync(join(dirname(pinnedTargetPath), ".provisioning-pending"))) {
+    claudeLog("token_refresh.provisioning_pending_gate", { pinnedTargetPath })
+    return false
+  }
+
   if (!(await acquireCredentialLock(lockDirPath, lockWaitMs))) {
     // 不偷鎖：逾時後若別的 writer 已寫入 successor 就直接採用，否則放棄本輪
     //（背景排程 failureRetryMs 後重試），orphan lock 留給 runbook §4.7 人工盤點。

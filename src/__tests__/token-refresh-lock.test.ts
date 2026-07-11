@@ -283,6 +283,48 @@ describe("cross-process credential lock (NoWayLM patch)", () => {
     expect(existsSync(hostLockDirPath)).toBe(true)
   })
 
+  it("host keepwarm successor-only 寫入（refreshToken 變、accessToken/expiresAt 原樣）：必須 adopt、不打 API", async () => {
+    // 對應 host keepwarm 的 missing-access-successor-preserved 路徑：只 rotate refresh token、
+    // 保留舊 accessToken 與舊 expiresAt。heuristic 必須靠 refreshToken 差異命中 adopt，
+    // 絕不可拿已死的 predecessor 去打 endpoint。
+    let fetchCallCount = 0
+    mockFetch(async () => {
+      fetchCallCount++
+      return makeTokenResponse()
+    })
+    mkdirSync(hostLockDirPath)
+
+    const store = createFileCredentialStore(credentialSymlinkPath)
+    const refreshPromise = refreshOAuthToken(store, 5000)
+    await sleep(300)
+    const successorOnly = makeCredentials("successor-only-refresh-token", Date.now() - 1000)
+    writeFileSync(hostCredentialPath, JSON.stringify(successorOnly), { mode: 0o600 })
+    rmdirSync(hostLockDirPath)
+
+    expect(await refreshPromise).toBe(true)
+    expect(fetchCallCount).toBe(0)
+    const remaining = JSON.parse(readFileSync(hostCredentialPath, "utf-8"))
+    expect(remaining.claudeAiOauth.refreshToken).toBe("successor-only-refresh-token")
+  })
+
+  it("provisioning pending marker 存在時拒絕 rotate（不取鎖、不打 API）", async () => {
+    let fetchCallCount = 0
+    mockFetch(async () => {
+      fetchCallCount++
+      return makeTokenResponse()
+    })
+    writeFileSync(join(hostDir, ".provisioning-pending"), "awaiting-keychain-separation|deadbeef\n", {
+      mode: 0o600,
+    })
+
+    const store = createFileCredentialStore(credentialSymlinkPath)
+    const ok = await refreshOAuthToken(store, 1000)
+
+    expect(ok).toBe(false)
+    expect(fetchCallCount).toBe(0)
+    expect(existsSync(hostLockDirPath)).toBe(false)
+  })
+
   it("HTTP 2xx 但 body 解析失敗：視為可能已消耗 → 保留 lock + 寫 incident marker（無 token）", async () => {
     let fetchCallCount = 0
     mockFetch(async () => {
