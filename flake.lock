@@ -2,7 +2,9 @@
   "nodes": {
     "bun2nix": {
       "inputs": {
-        "flake-parts": "flake-parts",
+        "flake-parts": [
+          "flake-parts"
+        ],
         "import-tree": "import-tree",
         "nixpkgs": [
           "nixpkgs"
@@ -29,19 +31,41 @@
     },
     "flake-parts": {
       "inputs": {
-        "nixpkgs-lib": "nixpkgs-lib"
+        "nixpkgs-lib": [
+          "nixpkgs"
+        ]
       },
       "locked": {
-        "lastModified": 1769996383,
-        "narHash": "sha256-AnYjnFWgS49RlqX7LrC4uA+sCCDBj0Ry/WOJ5XWAsa0=",
+        "lastModified": 1778716662,
+        "narHash": "sha256-m1Yf0wZ8j1OHjTc2UwHwyQRSnNeSgLJOd7q5Y45hzi4=",
         "owner": "hercules-ci",
         "repo": "flake-parts",
-        "rev": "57928607ea566b5db3ad13af0e57e921e6b12381",
+        "rev": "f7c1a2d347e4c52d5fb8d10cb4d94b5884e546fb",
         "type": "github"
       },
       "original": {
         "owner": "hercules-ci",
         "repo": "flake-parts",
+        "type": "github"
+      }
+    },
+    "home-manager": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1781642113,
+        "narHash": "sha256-mAR7KTS9rjreTcXCNqfCbN96mnhJO8lDQq1vl7GviBQ=",
+        "owner": "nix-community",
+        "repo": "home-manager",
+        "rev": "df4e0465717a2d34f05b8ccd967275aaf3ceaa01",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "home-manager",
         "type": "github"
       }
     },
@@ -60,13 +84,61 @@
         "type": "github"
       }
     },
+    "meridian-plugin-hermes-scrub": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784311548,
+        "narHash": "sha256-7uBHuF7HuUZV3E1mYwZEK5AzyhfMVFUPpmGn0P31fmg=",
+        "owner": "rynfar",
+        "repo": "meridian-plugin-hermes-scrub",
+        "rev": "e54d44576f68af72725acb64ae62ce95389b06e0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rynfar",
+        "repo": "meridian-plugin-hermes-scrub",
+        "type": "github"
+      }
+    },
+    "meridian-plugin-opencode-scrub": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784311551,
+        "narHash": "sha256-DhvhWaCCFrXcEwBzt6Y9lrqU97s1Wb5KR4VbQMz6H4c=",
+        "owner": "rynfar",
+        "repo": "meridian-plugin-opencode-scrub",
+        "rev": "0e491243924785995a9ed9e7f5044fb910aa374f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rynfar",
+        "repo": "meridian-plugin-opencode-scrub",
+        "type": "github"
+      }
+    },
+    "meridian-plugin-pi-scrub": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1784311555,
+        "narHash": "sha256-/2Ov+rmi8JqTjIHGoqz+2A7WIbOXY9UneAv1Nbu27Uc=",
+        "owner": "rynfar",
+        "repo": "meridian-plugin-pi-scrub",
+        "rev": "bf448621f77db812cd69f1f81f4a5c8feb574f15",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rynfar",
+        "repo": "meridian-plugin-pi-scrub",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1776169885,
-        "narHash": "sha256-l/iNYDZ4bGOAFQY2q8y5OAfBBtrDAaPuRQqWaFHVRXM=",
+        "lastModified": 1784120854,
+        "narHash": "sha256-KesHgItiZPgGX740axSiQLcIQ8D24MDqNpkKYWIek8k=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "4bd9165a9165d7b5e33ae57f3eecbcb28fb231c9",
+        "rev": "753cc8a3a87467296ddd1fa93f0cc3e81120ee46",
         "type": "github"
       },
       "original": {
@@ -76,24 +148,14 @@
         "type": "github"
       }
     },
-    "nixpkgs-lib": {
-      "locked": {
-        "lastModified": 1769909678,
-        "narHash": "sha256-cBEymOf4/o3FD5AZnzC3J9hLbiZ+QDT/KDuyHXVJOpM=",
-        "owner": "nix-community",
-        "repo": "nixpkgs.lib",
-        "rev": "72716169fe93074c333e8d0173151350670b824c",
-        "type": "github"
-      },
-      "original": {
-        "owner": "nix-community",
-        "repo": "nixpkgs.lib",
-        "type": "github"
-      }
-    },
     "root": {
       "inputs": {
         "bun2nix": "bun2nix",
+        "flake-parts": "flake-parts",
+        "home-manager": "home-manager",
+        "meridian-plugin-hermes-scrub": "meridian-plugin-hermes-scrub",
+        "meridian-plugin-opencode-scrub": "meridian-plugin-opencode-scrub",
+        "meridian-plugin-pi-scrub": "meridian-plugin-pi-scrub",
         "nixpkgs": "nixpkgs",
         "systems": "systems"
       }

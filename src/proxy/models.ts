@@ -7,6 +7,7 @@ import { existsSync, statSync } from "fs"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
 import { promisify } from "util"
+import { env } from "../env"
 
 const exec = promisify(execCallback)
 const execFile = promisify(execFileCallback)
@@ -21,7 +22,7 @@ const execFile = promisify(execFileCallback)
  */
 const STUB_SIZE_THRESHOLD = 4096
 
-export type ClaudeModel = "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]" | "haiku"
+export type ClaudeModel = "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]" | "haiku" | "fable" | "fable[1m]"
 
 /**
  * Current canonical pins for the `sonnet`/`opus`/`haiku` SDK aliases.
@@ -39,8 +40,9 @@ export type ClaudeModel = "sonnet" | "sonnet[1m]" | "opus" | "opus[1m]" | "haiku
  * override via MERIDIAN_DEFAULT_{TYPE}_MODEL (proxy-side) or
  * ANTHROPIC_DEFAULT_{TYPE}_MODEL (shell env, wins over Meridian's pin).
  */
+export const CANONICAL_FABLE_MODEL = "claude-fable-5"
 export const CANONICAL_OPUS_MODEL = "claude-opus-4-8"
-export const CANONICAL_SONNET_MODEL = "claude-sonnet-4-6"
+export const CANONICAL_SONNET_MODEL = "claude-sonnet-5"
 export const CANONICAL_HAIKU_MODEL = "claude-haiku-4-5"
 
 /**
@@ -56,10 +58,33 @@ export function resolveSdkModelDefaults(
   env: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
   return {
+    ANTHROPIC_DEFAULT_FABLE_MODEL: env.MERIDIAN_DEFAULT_FABLE_MODEL ?? CANONICAL_FABLE_MODEL,
     ANTHROPIC_DEFAULT_OPUS_MODEL: env.MERIDIAN_DEFAULT_OPUS_MODEL ?? CANONICAL_OPUS_MODEL,
     ANTHROPIC_DEFAULT_SONNET_MODEL: env.MERIDIAN_DEFAULT_SONNET_MODEL ?? CANONICAL_SONNET_MODEL,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: env.MERIDIAN_DEFAULT_HAIKU_MODEL ?? CANONICAL_HAIKU_MODEL,
   }
+}
+
+/**
+ * Per-request tier pin for explicitly versioned model ids (#631).
+ *
+ * mapModelToClaudeModel collapses every family request to a tier alias
+ * ("sonnet"/"opus"/...) that the SDK resolves via ANTHROPIC_DEFAULT_*_MODEL.
+ * With canonical pins alone, an explicit `claude-sonnet-5` silently resolved
+ * to the canonical sonnet — a proxy must never substitute models, so a
+ * fully-versioned id overrides its tier's pin for that request only.
+ *
+ * Bare aliases ("sonnet", "opus[1m]") and unversioned family names return
+ * undefined and keep the canonical pins. Mythos rides the fable tier
+ * (claude-mythos-5 shares it — see mapModelToClaudeModel). A trailing [1m]
+ * suffix is stripped; extended context stays alias-level.
+ */
+export function explicitModelPin(requestedModel: string): Record<string, string> | undefined {
+  const base = requestedModel.trim().toLowerCase().replace(/\[1m\]$/, "")
+  const match = /^claude-(sonnet|opus|haiku|fable|mythos)-\d[\w.-]*$/.exec(base)
+  if (!match) return undefined
+  const tier = match[1] === "mythos" ? "FABLE" : match[1]!.toUpperCase()
+  return { [`ANTHROPIC_DEFAULT_${tier}_MODEL`]: base }
 }
 export interface ClaudeAuthStatus {
   loggedIn?: boolean
@@ -85,6 +110,11 @@ let cachedAuthStatusPromise: Promise<ClaudeAuthStatus | null> | null = null
  * Older models (4.5 and earlier) do not.
  */
 function supports1mContext(model: string): boolean {
+  // Global opt-out: MERIDIAN_1M_CONTEXT_SUPPORT=0 (or false/no) disables 1M
+  // auto-selection entirely, downgrading every model to its base variant.
+  // Accepts the CLAUDE_PROXY_ alias and all falsy spellings via env().
+  const override = env("1M_CONTEXT_SUPPORT")
+  if (override === "0" || override === "false" || override === "no") return false
   // Explicit older versions (4-5, 4.5, etc.) do not support 1M
   if (model.includes("4-5") || model.includes("4.5")) return false
   // Everything else (bare names, 4-6, unknown) defaults to latest (1M capable)
@@ -98,6 +128,23 @@ export function mapModelToClaudeModel(model: string, subscriptionType?: string |
   // Subagents handle focused subtasks and don't benefit from 1M context.
   // Using the base model preserves rate limit budget for the primary agent.
   const isSubagent = agentMode === "subagent"
+
+  // Fable [1m]: Fable 5 supports the 1M extended context window and, like Opus,
+  // is included on Max with no Extra Usage charge (verified on Max — a
+  // fable[1m] request returns normally, no Extra Usage error). Mirrors the opus
+  // handling: [1m] for primary agents, base model for subagents, honoring the
+  // shared Extra Usage cooldown so a future billing change auto-downgrades.
+  //
+  // Mythos rides the fable tier: Claude Mythos 5 (claude-mythos-5, Project
+  // Glasswing) shares Fable 5's underlying model, context window, and API
+  // surface, and the Claude Agent SDK has no separate "mythos" alias. Routing
+  // it here (instead of the sonnet fallthrough) keeps explicit mythos requests
+  // on the right tier; server.ts pins ANTHROPIC_DEFAULT_FABLE_MODEL to the
+  // requested claude-mythos-* id so the concrete model passes through verbatim.
+  if (model.includes("fable") || model.includes("mythos")) {
+    if (use1m && !isSubagent && !isExtendedContextKnownUnavailable()) return "fable[1m]"
+    return "fable"
+  }
 
   // Opus [1m]: included with Max, Team, and Enterprise subscriptions per
   // Anthropic docs (https://code.claude.com/docs/en/model-config#extended-context).
@@ -165,6 +212,7 @@ export function resetExtendedContextUnavailable(): void {
 export function stripExtendedContext(model: ClaudeModel): ClaudeModel {
   if (model === "opus[1m]") return "opus"
   if (model === "sonnet[1m]") return "sonnet"
+  if (model === "fable[1m]") return "fable"
   return model
 }
 

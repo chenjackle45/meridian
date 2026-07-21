@@ -17,7 +17,7 @@ export const dashboardHtml = `<!DOCTYPE html>
   :root { --total: var(--accent); }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-         background: var(--bg); color: var(--text); padding: 0; line-height: 1.5; }
+         color: var(--text); padding: 0; line-height: 1.5; }
   h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
   .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
@@ -76,14 +76,35 @@ export const dashboardHtml = `<!DOCTYPE html>
                 transition: all 0.15s; }
   .log-filter:hover { border-color: var(--accent); color: var(--text); }
   .log-filter.active { background: rgba(88,166,255,0.1); border-color: var(--accent); color: var(--accent); }
+
+  /* Usage tab */
+  .usage-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .ucard { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; }
+  .ucard-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .ucard-title { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .ucard-reset { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .ucard-pct { font-size: 32px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; margin-top: 8px; color: var(--green); }
+  .ucard.warn .ucard-pct { color: var(--yellow); }
+  .ucard.high .ucard-pct { color: var(--red); }
+  .ucard-sub { font-size: 12px; color: var(--muted); margin-top: 8px; min-height: 16px; }
+  .ubar { position: relative; height: 8px; border-radius: 4px; background: var(--border); overflow: visible; margin-top: 12px; }
+  .ubar-fill { height: 100%; border-radius: 4px; background: var(--green); transition: width 0.4s ease; max-width: 100%; }
+  .ucard.warn .ubar-fill { background: var(--yellow); }
+  .ucard.high .ubar-fill { background: var(--red); }
+  .ubar-marker { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); opacity: 0.55; border-radius: 1px; }
+  .pace-pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+  .pace-pill.on, .pace-pill.under { background: rgba(63,185,80,0.15); color: var(--green); }
+  .pace-pill.ahead { background: rgba(210,153,34,0.18); color: var(--yellow); }
+  .pace-pill.over { background: rgba(248,81,73,0.15); color: var(--red); }
+  .usage-note { font-size: 11px; color: var(--muted); }
 ` + profileBarCss + `
 </style>
 </head>
 <body>
 ` + profileBarHtml + `
 <div style="padding:24px">
-<h1>Meridian</h1>
-<div class="subtitle">Request Performance Telemetry</div>
+<h1>Telemetry</h1>
+<div class="subtitle">Request performance, cost, and wire-contract integrity</div>
 
 <div class="refresh-bar">
   <select id="window">
@@ -121,6 +142,26 @@ function ago(ts) {
   return Math.floor(s/3600) + 'h ago';
 }
 
+function fmtTok(n) {
+  return n > 1000000 ? (n/1000000).toFixed(1) + 'M' : n > 1000 ? Math.round(n/1000) + 'k' : String(n);
+}
+
+// Model names come from client-supplied request bodies (requestModel) — escape
+// before concatenating into innerHTML so a quirky/malicious client can't
+// script the dashboard.
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (ch) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch];
+  });
+}
+
+function usd(v) {
+  if (v == null) return '—';
+  if (v > 0 && v < 0.01) return '$' + v.toFixed(4);
+  if (v < 100) return '$' + v.toFixed(2);
+  return '$' + Math.round(v).toLocaleString();
+}
+
 function pctRow(label, color, phase) {
   return '<tr>'
     + '<td><span class="phase-dot" style="background:' + color + '"></span>' + label + '</td>'
@@ -150,20 +191,22 @@ function setLogFilter(filter) {
 async function refresh() {
   const w = $('#window').value;
   try {
-    const [summary, reqs, logs] = await Promise.all([
+    const [summary, reqs, logs, quota] = await Promise.all([
       fetch('/telemetry/summary?window=' + w).then(r => r.json()),
       fetch('/telemetry/requests?limit=50&since=' + (Date.now() - Number(w))).then(r => r.json()),
       fetch('/telemetry/logs?limit=200&since=' + (Date.now() - Number(w))).then(r => r.json()),
+      fetch('/v1/usage/quota').then(r => r.json()).catch(() => null),
     ]);
-    render(summary, reqs, logs);
+    render(summary, reqs, logs, quota);
     $('#lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
   } catch (e) {
     $('#content').innerHTML = '<div class="empty">Failed to load telemetry</div>';
   }
 }
 
-function render(s, reqs, logs) {
-  if (s.totalRequests === 0 && (!logs || logs.length === 0)) {
+function render(s, reqs, logs, quota) {
+  const hasUsage = quota && quota.buckets && quota.buckets.some(b => b.utilization != null);
+  if (s.totalRequests === 0 && (!logs || logs.length === 0) && !hasUsage) {
     $('#content').innerHTML = '<div class="empty">No requests recorded yet. Send a request through the proxy to see telemetry.</div>';
     return;
   }
@@ -181,6 +224,7 @@ function render(s, reqs, logs) {
     +   'Requests<span class="tab-badge">' + reqs.length + '</span></div>'
     + '<div class="tab' + (activeTab === 'logs' ? ' active' : '') + '" data-tab="logs" onclick="switchTab(&apos;logs&apos;)">'
     +   'Logs<span class="tab-badge">' + logs.length + '</span></div>'
+    + '<div class="tab' + (activeTab === 'usage' ? ' active' : '') + '" data-tab="usage" onclick="switchTab(&apos;usage&apos;)">Usage</div>'
     + '</div>';
 
   // ==================== Overview tab ====================
@@ -190,6 +234,7 @@ function render(s, reqs, logs) {
   html += '<div class="cards">'
     + card('Requests', s.totalRequests, s.requestsPerMinute.toFixed(1) + ' req/min')
     + card('Errors', s.errorCount, s.totalRequests > 0 ? ((s.errorCount/s.totalRequests)*100).toFixed(1) + '% error rate' : '')
+    + '<div class="card"><div class="card-label">Envelope</div><div class="card-value" style="color:' + ((s.envelopeViolationCount || 0) > 0 ? 'var(--red)' : 'var(--green)') + '">' + (s.envelopeViolationCount || 0) + '</div><div class="card-detail">' + ((s.envelopeViolationCount || 0) > 0 ? 'wire-contract violations — check logs' : 'wire contract clean') + '</div></div>'
     + card('Median Total', ms(s.totalDuration.p50), 'p95: ' + ms(s.totalDuration.p95))
     + card('Median TTFB', ms(s.ttfb.p50), 'p95: ' + ms(s.ttfb.p95))
     + card('Proxy Overhead', ms(s.proxyOverhead.p50), 'p95: ' + ms(s.proxyOverhead.p95))
@@ -199,7 +244,6 @@ function render(s, reqs, logs) {
   // Token usage cards
   if (s.tokenUsage) {
     const t = s.tokenUsage;
-    const fmtTok = n => n > 1000000 ? (n/1000000).toFixed(1) + 'M' : n > 1000 ? Math.round(n/1000) + 'k' : String(n);
     html += '<div class="section"><div class="section-title">Token Usage</div></div>';
     html += '<div class="cards">'
       + card('Input Tokens', fmtTok(t.totalInputTokens), '')
@@ -210,12 +254,51 @@ function render(s, reqs, logs) {
       + '</div>';
   }
 
+  // Estimated cost: static API list pricing applied to the window's token usage
+  if (s.costEstimate && Object.keys(s.costEstimate.byModel).length > 0) {
+    const ce = s.costEstimate;
+    const costRows = Object.entries(ce.byModel)
+      .sort((a, b) => (b[1].estimatedUsd || 0) - (a[1].estimatedUsd || 0));
+
+    html += '<div class="section"><div class="section-title">Estimated Cost</div></div>';
+    html += '<div class="cards">'
+      + card('Est. API Cost', usd(ce.totalUsd), 'window total at API list prices');
+    for (const [model, m] of costRows) {
+      html += card(esc(model), usd(m.estimatedUsd), m.requests + ' req' + (m.requests === 1 ? '' : 's'));
+    }
+    html += '</div>';
+
+    html += '<div class="section">'
+      + '<table><thead><tr><th>Model</th><th>Requests</th><th>Input</th><th>Output</th>'
+      + '<th>Cache Read</th><th>Cache Write</th><th>Est. Cost</th></tr></thead><tbody>';
+    for (const [model, m] of costRows) {
+      html += '<tr>'
+        + '<td>' + esc(model) + (m.estimatedUsd == null ? ' <span style="font-size:10px;color:var(--yellow)">no pricing</span>' : '') + '</td>'
+        + '<td class="mono">' + m.requests + '</td>'
+        + '<td class="mono">' + fmtTok(m.inputTokens) + '</td>'
+        + '<td class="mono">' + fmtTok(m.outputTokens) + '</td>'
+        + '<td class="mono">' + fmtTok(m.cacheReadTokens) + '</td>'
+        + '<td class="mono">' + fmtTok(m.cacheCreationTokens) + '</td>'
+        + '<td class="mono">' + usd(m.estimatedUsd) + '</td>'
+        + '</tr>';
+    }
+    html += '</tbody></table>'
+      + '<div class="usage-note" style="margin-top:8px">Estimated at static Anthropic API list prices'
+      + ' (cache writes at the 5-minute TTL rate). Claude Max usage is covered by your subscription'
+      + ' (equivalent API cost, not a charge).'
+      + (ce.unpricedRequestCount > 0
+          ? ' ' + ce.unpricedRequestCount + ' request' + (ce.unpricedRequestCount === 1 ? '' : 's') + ' from unrecognized models excluded.'
+          : '')
+      + ' Rates are editable in <a href="/settings" style="color:var(--accent)">Settings</a>.'
+      + '</div></div>';
+  }
+
   // Model breakdown
   const models = Object.entries(s.byModel);
   if (models.length > 0) {
     html += '<div class="cards">';
     for (const [name, data] of models) {
-      html += card(name, data.count + ' reqs', 'avg ' + ms(data.avgTotalMs));
+      html += card(esc(name), data.count + ' reqs', 'avg ' + ms(data.avgTotalMs));
     }
     html += '</div>';
   }
@@ -267,6 +350,7 @@ function render(s, reqs, logs) {
     const respW = Math.max((r.upstreamDurationMs - (r.ttfbMs || 0)) * scale, 2);
 
     const lineageBadge = r.lineageType ? '<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:' + ({continuation:'var(--green)',compaction:'var(--yellow)',undo:'var(--purple)',diverged:'var(--red)',new:'var(--muted)'}[r.lineageType] || 'var(--muted)') + ';color:var(--bg)">' + r.lineageType + '</span>' : '';
+    const envBadge = (r.envelopeViolations && r.envelopeViolations.length > 0) ? ' <span style="font-size:10px;padding:1px 5px;border-radius:3px;background:var(--red);color:var(--bg)" title="' + r.envelopeViolations.join(', ') + '">envelope×' + r.envelopeViolations.length + '</span>' : '';
     const sessionShort = r.sdkSessionId ? r.sdkSessionId.slice(0, 8) : '—';
     const msgCount = r.messageCount != null ? r.messageCount : '?';
 
@@ -277,7 +361,7 @@ function render(s, reqs, logs) {
       + '<td>' + (r.adapter || '—') + sourceBadge + '</td>'
       + '<td>' + (r.requestModel || r.model) + '<br><span style="font-size:10px;color:var(--muted)">' + r.model + '</span></td>'
       + '<td>' + r.mode + (r.hasDeferredTools ? (function() { var sessDisc = r.sessionDiscoveredCount || 0; var loaded = ((r.toolCount || 0) - (r.deferredToolCount || 0)) + sessDisc; var deferred = Math.max(0, (r.deferredToolCount || 0) - sessDisc); var newDisc = r.discoveredTools || []; return '<br><span style="font-size:10px;color:var(--purple)">loaded=' + loaded + ' deferred=' + deferred + '</span>' + (newDisc.length > 0 ? '<br><span style="font-size:10px;color:var(--green)">+' + newDisc.join(', +') + '</span>' : ''); })() : '') + '</td>'
-      + '<td class="mono">' + sessionShort + ' ' + lineageBadge + '<br><span style="font-size:10px;color:var(--muted)">' + msgCount + ' msgs</span></td>'
+      + '<td class="mono">' + sessionShort + ' ' + lineageBadge + envBadge + '<br><span style="font-size:10px;color:var(--muted)">' + msgCount + ' msgs</span></td>'
       + '<td class="' + statusClass + '">' + statusText + '</td>'
       + '<td class="mono">' + ms(r.queueWaitMs) + '</td>'
       + '<td class="mono">' + ms(r.proxyOverheadMs) + '</td>'
@@ -330,6 +414,11 @@ function render(s, reqs, logs) {
   }
   html += '</div>'; // end logs panel
 
+  // ==================== Usage tab ====================
+  html += '<div id="panel-usage" class="tab-panel' + (activeTab === 'usage' ? ' active' : '') + '">';
+  html += renderUsage(quota);
+  html += '</div>'; // end usage panel
+
   $('#content').innerHTML = html;
 }
 
@@ -338,6 +427,101 @@ function card(label, value, detail) {
     + '<div class="card-value">' + value + '</div>'
     + (detail ? '<div class="card-detail">' + detail + '</div>' : '')
     + '</div>';
+}
+
+// ---- Usage tab helpers (mirror src/telemetry/profileUsage.ts; unit-tested there) ----
+function classifyUtil(u) {
+  if (u == null || !isFinite(u)) return '';
+  if (u >= 0.85) return 'high';
+  if (u >= 0.6) return 'warn';
+  return '';
+}
+function resetIn(resetsAt) {
+  if (resetsAt == null || !isFinite(resetsAt)) return '';
+  var ms = resetsAt - Date.now();
+  if (ms <= 0) return 'resetting…';
+  var m = Math.floor(ms / 60000);
+  if (m < 60) return 'resets in ' + Math.max(1, m) + 'm';
+  var h = Math.floor(m / 60), rm = m % 60;
+  if (h < 24) return 'resets in ' + h + 'h' + (rm ? ' ' + rm + 'm' : '');
+  var d = Math.floor(h / 24), rh = h % 24;
+  return 'resets in ' + d + 'd' + (rh ? ' ' + rh + 'h' : '');
+}
+function pct(u) { return Math.round(Math.max(0, u) * 100); }
+
+function usageCard(title, bucket) {
+  if (!bucket || bucket.utilization == null) {
+    return '<div class="ucard"><div class="ucard-head"><span class="ucard-title">' + title + '</span></div>'
+      + '<div class="ucard-pct" style="color:var(--muted)">—</div>'
+      + '<div class="ucard-sub">No data yet</div></div>';
+  }
+  var u = bucket.utilization;
+  var cls = classifyUtil(u);
+  var fill = Math.min(100, pct(u));
+  return '<div class="ucard ' + cls + '">'
+    + '<div class="ucard-head"><span class="ucard-title">' + title + '</span>'
+    +   '<span class="ucard-reset">' + resetIn(bucket.resetsAt) + '</span></div>'
+    + '<div class="ucard-pct">' + pct(u) + '<span style="font-size:16px;font-weight:500;color:var(--muted)">%</span></div>'
+    + '<div class="ubar"><div class="ubar-fill" style="width:' + fill + '%"></div></div>'
+    + '<div class="ucard-sub">of your ' + title.split('·')[1].trim() + ' allowance used</div>'
+    + '</div>';
+}
+
+// Weekly pace: actual vs. expected (even) consumption at this point in the 7-day window.
+function paceCard(weekly) {
+  if (!weekly || weekly.utilization == null || weekly.resetsAt == null) {
+    return '<div class="ucard"><div class="ucard-head"><span class="ucard-title">Weekly Pace</span></div>'
+      + '<div class="ucard-pct" style="color:var(--muted)">—</div>'
+      + '<div class="ucard-sub">Needs weekly usage data</div></div>';
+  }
+  var WEEK = 7 * 86400000;
+  var start = weekly.resetsAt - WEEK;
+  var elapsed = Math.max(0, Math.min(1, (Date.now() - start) / WEEK));
+  var actual = pct(weekly.utilization);
+  var expected = Math.round(elapsed * 100);
+  var delta = actual - expected;
+  var projected = elapsed >= 0.1 ? Math.round((Math.max(0, weekly.utilization) / elapsed) * 100) : null;
+
+  var pill, label;
+  if (delta > 7) { pill = 'ahead'; label = '+' + delta + '% ahead of pace'; }
+  else if (delta < -7) { pill = 'under'; label = Math.abs(delta) + '% under pace'; }
+  else { pill = 'on'; label = 'On pace'; }
+  if (projected != null && projected >= 100) { pill = 'over'; label = 'On track to run out'; }
+
+  var fill = Math.min(100, actual);
+  var mark = Math.min(100, expected);
+  var proj = projected == null ? '—' : projected + '%';
+  return '<div class="ucard">'
+    + '<div class="ucard-head"><span class="ucard-title">Weekly Pace</span>'
+    +   '<span class="ucard-reset">' + Math.round(elapsed * 100) + '% through week</span></div>'
+    + '<div style="margin-top:8px"><span class="pace-pill ' + pill + '">' + label + '</span></div>'
+    + '<div class="ubar"><div class="ubar-fill" style="width:' + fill + '%;background:' + (pill === 'over' ? 'var(--red)' : pill === 'ahead' ? 'var(--yellow)' : 'var(--green)') + '"></div>'
+    +   '<div class="ubar-marker" style="left:' + mark + '%" title="Expected at even pace"></div></div>'
+    + '<div class="ucard-sub">' + actual + '% used vs ' + expected + '% expected · at this rate ~' + proj + ' by reset</div>'
+    + '</div>';
+}
+
+function renderUsage(quota) {
+  if (!quota || !quota.buckets) {
+    return '<div class="empty">Usage data unavailable.</div>';
+  }
+  var by = {};
+  quota.buckets.forEach(function (b) { by[b.type] = b; });
+  var session = by['five_hour'], weekly = by['seven_day'];
+  if ((!session || session.utilization == null) && (!weekly || weekly.utilization == null)) {
+    return '<div class="empty">No usage data yet — Anthropic reports it after your first request through Meridian.</div>';
+  }
+  var h = '<div class="usage-cards">'
+    + usageCard('Session · 5h', session)
+    + usageCard('Weekly · 7d', weekly)
+    + paceCard(weekly)
+    + '</div>';
+  var asOf = quota.asOf ? new Date(quota.asOf).toLocaleTimeString() : '';
+  h += '<div class="usage-note">'
+    + (quota.profile ? 'Profile: ' + quota.profile + ' · ' : '')
+    + 'Reported by Anthropic' + (asOf ? ' · as of ' + asOf : '')
+    + '</div>';
+  return h;
 }
 
 $('#autoRefresh').addEventListener('change', function() {

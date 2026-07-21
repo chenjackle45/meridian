@@ -229,6 +229,50 @@ describe("refreshOAuthToken", () => {
     expect(fetchCount).toBe(1)
   })
 
+  it("deduplicates distinct store instances with the same refreshKey", async () => {
+    const first = makeStore().store
+    const second = makeStore().store
+    first.refreshKey = "file:/tmp/same-profile/.credentials.json"
+    second.refreshKey = "file:/tmp/same-profile/.credentials.json"
+    let fetchCount = 0
+    mockFetch(mock(async () => {
+      fetchCount++
+      return makeSuccessResponse(MOCK_TOKEN_RESPONSE)
+    }))
+    const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
+
+    const [r1, r2] = await Promise.all([
+      refreshOAuthToken(first),
+      refreshOAuthToken(second),
+    ])
+
+    expect(r1).toBe(true)
+    expect(r2).toBe(true)
+    expect(fetchCount).toBe(1)
+  })
+
+  it("does not share in-flight refreshes across different refreshKeys", async () => {
+    const first = makeStore().store
+    const second = makeStore().store
+    first.refreshKey = "file:/tmp/personal/.credentials.json"
+    second.refreshKey = "file:/tmp/work/.credentials.json"
+    let fetchCount = 0
+    mockFetch(mock(async () => {
+      fetchCount++
+      return makeSuccessResponse(MOCK_TOKEN_RESPONSE)
+    }))
+    const { refreshOAuthToken } = await import("../proxy/tokenRefresh")
+
+    const [r1, r2] = await Promise.all([
+      refreshOAuthToken(first),
+      refreshOAuthToken(second),
+    ])
+
+    expect(r1).toBe(true)
+    expect(r2).toBe(true)
+    expect(fetchCount).toBe(2)
+  })
+
   it("allows a second refresh after the first completes", async () => {
     const { store } = makeStore()
     let fetchCount = 0
@@ -440,6 +484,27 @@ describe("startBackgroundRefresh", () => {
     await tick(120) // let it retry a few times
 
     expect(fetchCalls).toBeGreaterThanOrEqual(2)
+  })
+
+  it("does not write scheduled refresh status to stderr by default", async () => {
+    const { startBackgroundRefresh } = await import("../proxy/tokenRefresh")
+    const originalError = console.error
+    const stderr: unknown[][] = []
+    console.error = (...args: unknown[]) => { stderr.push(args) }
+    try {
+      mockFetch(() => Promise.resolve(makeSuccessResponse(MOCK_TOKEN_RESPONSE)))
+      const { store } = makeStore({
+        ...MOCK_CREDENTIALS,
+        claudeAiOauth: { ...MOCK_CREDENTIALS.claudeAiOauth, expiresAt: Date.now() - 1000 },
+      })
+
+      startBackgroundRefresh(store, 1000, 60_000)
+      await tick(50)
+
+      expect(stderr).toHaveLength(0)
+    } finally {
+      console.error = originalError
+    }
   })
 
   it("is idempotent — second start() while running is a no-op", async () => {
@@ -696,5 +761,63 @@ describe("serializeCredentials", () => {
     // pretty-printed always contains a newline between fields; compact never does.
     expect(pretty).toContain("\n")
     expect(compact).not.toContain("\n")
+  })
+})
+
+describe("startBackgroundRefresh timer clamping (#515)", () => {
+  // Node clamps setTimeout delays above 2^31-1 ms to 1ms (with a warning). A
+  // token whose expiresAt is >~24.8 days out produces such a delay; without a
+  // clamp the 1ms timer re-fires, recomputes the same huge delay, and loops.
+  const MAX_32BIT = 2_147_483_647
+  let realSetTimeout: typeof globalThis.setTimeout
+  let recordedDelays: number[]
+
+  beforeEach(async () => {
+    const { stopBackgroundRefresh } = await import("../proxy/tokenRefresh")
+    stopBackgroundRefresh()
+    realSetTimeout = globalThis.setTimeout
+    recordedDelays = []
+    globalThis.setTimeout = ((_fn: unknown, delay?: number) => {
+      recordedDelays.push(delay ?? 0)
+      // Do not actually schedule — just record the requested delay.
+      return { unref() {} } as unknown as ReturnType<typeof setTimeout>
+    }) as typeof globalThis.setTimeout
+  })
+
+  afterEach(async () => {
+    globalThis.setTimeout = realSetTimeout
+    const { stopBackgroundRefresh } = await import("../proxy/tokenRefresh")
+    stopBackgroundRefresh()
+  })
+
+  // Let scheduleNext's awaited store.read() settle. Uses the real timer.
+  function flush(): Promise<void> {
+    return new Promise((resolve) => realSetTimeout(resolve, 5))
+  }
+
+  function storeWithExpiry(expiresAt: number) {
+    return makeStore({
+      ...MOCK_CREDENTIALS,
+      claudeAiOauth: { ...MOCK_CREDENTIALS.claudeAiOauth, expiresAt },
+    }).store
+  }
+
+  it("clamps a >24.8-day delay to the 32-bit max instead of overflowing to 1ms", async () => {
+    const { startBackgroundRefresh } = await import("../proxy/tokenRefresh")
+    const far = Date.now() + 40 * 24 * 60 * 60 * 1000 // 40 days out
+    startBackgroundRefresh(storeWithExpiry(far))
+    await flush()
+    expect(recordedDelays.length).toBeGreaterThan(0)
+    expect(recordedDelays[recordedDelays.length - 1]).toBe(MAX_32BIT)
+  })
+
+  it("does not clamp a normal ~8h delay", async () => {
+    const { startBackgroundRefresh } = await import("../proxy/tokenRefresh")
+    const soon = Date.now() + 8 * 60 * 60 * 1000 // 8h out
+    startBackgroundRefresh(storeWithExpiry(soon))
+    await flush()
+    const d = recordedDelays[recordedDelays.length - 1]!
+    expect(d).toBeGreaterThan(0)
+    expect(d).toBeLessThan(MAX_32BIT)
   })
 })

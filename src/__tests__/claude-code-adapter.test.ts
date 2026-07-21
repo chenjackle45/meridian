@@ -19,21 +19,47 @@ describe("claudeCodeAdapter — identity", () => {
 })
 
 describe("claudeCodeAdapter.getSessionId", () => {
-  it("always returns undefined — Claude Code sends no session header", () => {
+  it("extracts a session ID from Claude Code's JSON-string metadata", () => {
     const ctx = {
       req: { header: () => "any-value" },
     }
-    expect(claudeCodeAdapter.getSessionId(ctx as any)).toBeUndefined()
+    const body = {
+      metadata: {
+        user_id: JSON.stringify({
+          device_id: "device-1",
+          account_uuid: "",
+          session_id: "session-from-metadata",
+        }),
+      },
+    }
+    expect(claudeCodeAdapter.getSessionId(ctx as any, body)).toBe("session-from-metadata")
   })
 
-  it("returns undefined even when x-opencode-session is present", () => {
+  it("accepts object-form metadata for compatible gateways", () => {
+    const ctx = { req: { header: () => undefined } }
+    const body = { metadata: { user_id: { session_id: "object-session" } } }
+    expect(claudeCodeAdapter.getSessionId(ctx as any, body)).toBe("object-session")
+  })
+
+  it("falls back to fingerprinting when metadata is absent or malformed", () => {
+    const ctx = { req: { header: () => undefined } }
+    expect(claudeCodeAdapter.getSessionId(ctx as any, {})).toBeUndefined()
+    expect(claudeCodeAdapter.getSessionId(ctx as any, {
+      metadata: { user_id: "not-json" },
+    })).toBeUndefined()
+    expect(claudeCodeAdapter.getSessionId(ctx as any, {
+      metadata: { user_id: JSON.stringify({ device_id: "device-1" }) },
+    })).toBeUndefined()
+  })
+
+  it("ignores unrelated session headers", () => {
     const ctx = {
       req: {
         header: (name: string) =>
           name === "x-opencode-session" ? "sess-abc" : undefined,
       },
     }
-    expect(claudeCodeAdapter.getSessionId(ctx as any)).toBeUndefined()
+    expect(claudeCodeAdapter.getSessionId(ctx as any, {})).toBeUndefined()
   })
 })
 

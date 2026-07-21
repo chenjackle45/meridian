@@ -5,6 +5,7 @@ import * as path from "node:path"
 import { exec } from "node:child_process"
 import { promisify } from "node:util"
 import { glob as globLib } from "glob"
+import { runGrepTool } from "./grepTool"
 
 const execAsync = promisify(exec)
 
@@ -176,24 +177,7 @@ export function createOpencodeMcpServer() {
         path: z.string().optional().describe("Directory or file to search in"),
         include: z.string().optional().describe("File pattern to include, e.g., *.ts")
       },
-      async (args) => {
-        try {
-          const searchPath = args.path || getCwd()
-          const includePattern = args.include || "*"
-          
-          let cmd = `grep -rn --include="${includePattern}" "${args.pattern}" "${searchPath}" 2>/dev/null || true`
-          const { stdout } = await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 })
-          
-          return {
-            content: [{ type: "text", text: stdout || "(no matches)" }]
-          }
-        } catch (error) {
-          return {
-            content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
-            isError: true
-          }
-        }
-      }
+      runGrepTool
     )
   ]
   })

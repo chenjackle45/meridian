@@ -16,7 +16,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   ${themeCss}
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-         background: var(--bg); color: var(--text); padding: 0; line-height: 1.5; }
+         color: var(--text); padding: 0; line-height: 1.5; }
   .container { max-width: 800px; margin: 0 auto; padding: 24px; }
   h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
   .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
@@ -68,7 +68,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   .guide li { margin-bottom: 8px; }
   .guide code {
     font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px;
-    background: var(--bg); padding: 2px 6px; border-radius: 4px; color: var(--purple);
+    background: var(--bg); padding: 2px 6px; border-radius: 4px; color: var(--accent2);
   }
   .guide .warn {
     margin-top: 12px; padding: 12px 16px; background: rgba(210,153,34,0.1);
@@ -79,7 +79,7 @@ export const profilePageHtml = `<!DOCTYPE html>
   .mono { font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .copy-cmd {
     font-family: 'SF Mono', SFMono-Regular, Consolas, monospace; font-size: 12px;
-    background: var(--bg); padding: 4px 10px; border-radius: 4px; color: var(--purple);
+    background: var(--bg); padding: 4px 10px; border-radius: 4px; color: var(--accent2);
     cursor: pointer; border: 1px solid var(--border); transition: border-color 0.15s;
   }
   .copy-btn {
@@ -168,7 +168,7 @@ export const profilePageHtml = `<!DOCTYPE html>
 
     <h3 style="margin-top:16px">Switching profiles</h3>
     <ol>
-      <li><strong>UI:</strong> Use the dropdown at the top of this page</li>
+      <li><strong>UI:</strong> Click an account card on the <a href="/" style="color:var(--accent)">home page</a>, or the Switch button on this page</li>
       <li><strong>CLI:</strong> <code>meridian profile switch &lt;name&gt;</code></li>
       <li><strong>Per-request:</strong> Send <code>x-meridian-profile: &lt;name&gt;</code> header</li>
     </ol>

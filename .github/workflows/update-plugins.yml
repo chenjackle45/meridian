@@ -1,0 +1,47 @@
+name: Update plugin inputs
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+  # Event-driven bumps (#650): each meridian-plugin-* repo fires this on
+  # push to its default branch, so a plugin change lands here immediately
+  # instead of up to 24h late. The cron stays as a safety net.
+  repository_dispatch:
+    types: [plugin-updated]
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+
+      - name: Bump plugin inputs and verify each still builds
+        run: |
+          for input in $(nix flake metadata --json | jq -r '.locks.nodes.root.inputs | keys[] | select(startswith("meridian-plugin-"))'); do
+            nix flake update "$input"
+            nix build ".#meridianPlugins.${input#meridian-plugin-}" --no-link --print-out-paths
+          done
+
+      # All changes reach main through PRs (repo policy — never a direct
+      # push, which branch protection would reject anyway). Re-runs update
+      # the same branch/PR in place. Note: PRs opened with the default
+      # GITHUB_TOKEN don't trigger CI workflows, so the required `test`
+      # check won't run automatically — each plugin build above is the real
+      # gate for a lock bump, and the PR is merged with admin rights like
+      # every other PR in this repo.
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore: update plugin flake inputs"
+          title: "chore: update plugin flake inputs"
+          body: |
+            Automated bump of the `meridian-plugin-*` flake inputs.
+            Every plugin was rebuilt against its new pin before this PR was
+            opened — a failing build blocks the bump entirely.
+          branch: chore/update-plugin-inputs
+          add-paths: flake.lock
+          delete-branch: true

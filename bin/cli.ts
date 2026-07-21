@@ -38,6 +38,8 @@ Environment variables:
   MERIDIAN_HOST                     Host to bind to (default: 127.0.0.1)
   MERIDIAN_PASSTHROUGH              Enable passthrough mode (tools forwarded to client)
   MERIDIAN_IDLE_TIMEOUT_SECONDS     Idle timeout in seconds (default: 120)
+  MERIDIAN_PLUGIN_DIR               Plugin auto-discovery directory (default: ~/.config/meridian/plugins)
+  MERIDIAN_PLUGIN_CONFIG            Plugin manifest path (default: ~/.config/meridian/plugins.json)
 
 See https://github.com/rynfar/meridian for full documentation.`)
   process.exit(0)
@@ -47,28 +49,41 @@ if (args[0] === "profile") {
   const { profileAdd, profileAddOauthToken, profileList, profileRemove, profileSwitch, profileLogin, profileHelp } = await import("../src/proxy/profileCli")
   const subcommand = args[1]
   const profileId = args[2]
+  const headless = args.includes("--headless")
 
   if (subcommand === "add" && profileId) {
     const oauthFlagIdx = args.indexOf("--oauth-token", 3)
     if (oauthFlagIdx >= 0) {
       const tokenArg = args[oauthFlagIdx + 1]
-      await profileAddOauthToken(profileId, tokenArg)
+      await profileAddOauthToken(profileId, tokenArg?.startsWith("--") ? undefined : tokenArg)
     } else {
-      profileAdd(profileId)
+      await profileAdd(profileId, { headless })
     }
   }
   else if (subcommand === "list" || subcommand === "ls") profileList()
   else if (subcommand === "remove" && profileId) profileRemove(profileId)
   else if (subcommand === "switch" && profileId) await profileSwitch(profileId)
-  else if (subcommand === "login" && profileId) profileLogin(profileId)
+  else if (subcommand === "login" && profileId) await profileLogin(profileId, { headless })
   else profileHelp()
   process.exit(0)
 }
 
 if (args[0] === "setup") {
-  const { findPluginPath, runSetup } = await import("../src/proxy/setup")
+  const { findPluginPath, runSetup, UnparseableConfigError } = await import("../src/proxy/setup")
   const pluginPath = findPluginPath(import.meta.url)
-  const result = runSetup(pluginPath)
+  let result
+  try {
+    result = runSetup(pluginPath)
+  } catch (err) {
+    if (err instanceof UnparseableConfigError) {
+      console.error(`\x1b[31m✗ Could not parse ${err.configPath}\x1b[0m`)
+      console.error("  Your config was left untouched. Fix the syntax error, then re-run")
+      console.error(`  'meridian setup' — or add this plugin manually:`)
+      console.error(`    "plugin": ["${pluginPath}"]`)
+      process.exit(1)
+    }
+    throw err
+  }
 
   if (result.alreadyConfigured) {
     console.log(`\x1b[32m✓ Meridian plugin already configured\x1b[0m`)
@@ -102,17 +117,16 @@ if (args[0] === "refresh-token") {
 const exec = promisify(execCallback)
 const execFile = promisify(execFileCallback)
 
-// Prevent SDK subprocess crashes from killing the proxy
-process.on("uncaughtException", (err) => {
-  console.error(`[PROXY] Uncaught exception (recovered): ${err.message}`)
-})
-process.on("unhandledRejection", (reason) => {
-  console.error(`[PROXY] Unhandled rejection (recovered): ${reason instanceof Error ? reason.message : reason}`)
-})
+// Process error handlers (SDK subprocess crash recovery, socket EPIPE, etc.)
+// are installed by startProxyServer when `installProcessErrorHandlers: true`
+// is passed below. Library consumers can either pass the same flag or call
+// `installProxyProcessErrorHandlers()` directly.
 
 const port = parseInt(process.env.MERIDIAN_PORT ?? process.env.CLAUDE_PROXY_PORT ?? "3456", 10)
 const host = process.env.MERIDIAN_HOST ?? process.env.CLAUDE_PROXY_HOST ?? "127.0.0.1"
 const idleTimeoutSeconds = parseInt(process.env.MERIDIAN_IDLE_TIMEOUT_SECONDS ?? process.env.CLAUDE_PROXY_IDLE_TIMEOUT_SECONDS ?? "120", 10)
+const pluginDir = process.env.MERIDIAN_PLUGIN_DIR
+const pluginConfigPath = process.env.MERIDIAN_PLUGIN_CONFIG
 
 // Load profile configuration:
 //   1. MERIDIAN_PROFILES env var (JSON array) — takes precedence
@@ -190,7 +204,7 @@ export async function runCli(
     enableDiskProfileDiscovery()
   }
 
-  const proxy = await start({ port, host, idleTimeoutSeconds, profiles, defaultProfile, version })
+  const proxy = await start({ port, host, idleTimeoutSeconds, pluginDir, pluginConfigPath, profiles, defaultProfile, version, installProcessErrorHandlers: true })
 
   // Handle EADDRINUSE — preserve CLI behavior of exiting on port conflict
   proxy.server.on("error", (error: NodeJS.ErrnoException) => {

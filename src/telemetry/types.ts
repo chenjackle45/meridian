@@ -31,8 +31,17 @@ export interface RequestMetric {
   /** Original model string from the client request (e.g. "claude-sonnet-4-6-20250312") */
   requestModel?: string
 
+  /** Profile that served the request (multi-account); absent on early
+   *  parse-error records where profile resolution never ran. */
+  profileId?: string
+
   /** Streaming or non-streaming */
   mode: "stream" | "non-stream"
+
+  /** Envelope-integrity violations detected on this response (dangling_block,
+   *  undelivered_tool_use, empty_tool_input). Absent when the envelope was
+   *  clean — the overwhelmingly common case. See proxy/envelopeIntegrity.ts. */
+  envelopeViolations?: string[]
 
   /** Whether the request used session resume */
   isResume: boolean
@@ -124,6 +133,31 @@ export interface PhaseTiming {
   avg: number
 }
 
+/** Per-model token totals and estimated cost at static API list prices. */
+export interface ModelCostBreakdown {
+  requests: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  /** Estimated USD for this model's requests; null when the model has no pricing entry */
+  estimatedUsd: number | null
+}
+
+/** Aggregate cost estimate across a window. Estimates only: Claude Max
+ *  usage is covered by the subscription; this is the equivalent API cost. */
+export interface CostEstimate {
+  /** Sum across all priced models (unpriced models excluded) */
+  totalUsd: number
+  /** Keyed by requestModel || model, matching TelemetrySummary.byModel */
+  byModel: Record<string, ModelCostBreakdown>
+  /** Requests whose model had no pricing entry, excluded from totalUsd */
+  unpricedRequestCount: number
+  /** Per-profile rollup (multi-account): estimated USD + request count.
+   *  Keyed by RequestMetric.profileId, "default" when absent. */
+  byProfile: Record<string, { requests: number; estimatedUsd: number }>
+}
+
 export interface TelemetrySummary {
   /** Time window these stats cover */
   windowMs: number
@@ -131,6 +165,9 @@ export interface TelemetrySummary {
   totalRequests: number
   /** Requests that returned an error */
   errorCount: number
+  /** Total envelope-integrity violations across the window (dangling blocks,
+   *  undelivered tool calls, empty required inputs). 0 = wire contract clean. */
+  envelopeViolationCount: number
   /** Requests per minute */
   requestsPerMinute: number
 
@@ -156,6 +193,9 @@ export interface TelemetrySummary {
     /** Requests where cache hit rate was 0 despite being a resume */
     cacheMissOnResumeCount: number
   }
+
+  /** Estimated cost of the window's usage at static API list prices */
+  costEstimate: CostEstimate
 }
 
 /** Storage backend for request metrics. */

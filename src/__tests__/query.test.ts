@@ -69,12 +69,12 @@ describe("buildQueryOptions", () => {
     expect(result.options.maxTurns).toBe(3)
   })
 
-  it("sets maxTurns to 3 in passthrough mode with deferred tools (ToolSearch fits within base budget)", () => {
+  it("sets maxTurns to 4 in passthrough mode with deferred tools (+1 for the ToolSearch discovery turn, #547)", () => {
     const result = buildQueryOptions(makeContext({ passthrough: true, hasDeferredTools: true }))
-    expect(result.options.maxTurns).toBe(3)
+    expect(result.options.maxTurns).toBe(4)
   })
 
-  it("sets maxTurns to 4 in passthrough mode when resume AND deferred tools are both active", () => {
+  it("sets maxTurns to 4 in passthrough mode when resume AND deferred tools are both active (resume rehydration is inline; only the discovery turn adds)", () => {
     const result = buildQueryOptions(makeContext({
       passthrough: true,
       resumeSessionId: "sess-123",
@@ -93,9 +93,9 @@ describe("buildQueryOptions", () => {
     expect(result.options.maxTurns).toBe(6)
   })
 
-  it("sets maxTurns to 6 in passthrough mode with advisor + deferred tools", () => {
+  it("sets maxTurns to 7 in passthrough mode with advisor + deferred tools (base 3 + discovery 1 + advisor 3)", () => {
     const result = buildQueryOptions(makeContext({ passthrough: true, advisorModel: "claude-opus-4-7", hasDeferredTools: true }))
-    expect(result.options.maxTurns).toBe(6)
+    expect(result.options.maxTurns).toBe(7)
   })
 
   it("sets maxTurns to 7 in passthrough mode with advisor + resume + deferred tools (all three active)", () => {
@@ -372,11 +372,32 @@ describe("buildQueryOptions", () => {
     expect(opts.settings.autoDreamEnabled).toBe(true)
   })
 
-  it("omits settingSources and settings when settingSources empty", () => {
-    const result = buildQueryOptions(makeContext({ settingSources: [] }))
+  // #634: settings (the --settings flag domain) is independent of
+  // settingSources (file domains). Empty sources must still send the memory
+  // controls — otherwise memory:false is silently ignored and the SDK's
+  // built-in default injects MEMORY.md into every session.
+  it("sends settings even when settingSources is empty (#634)", () => {
+    const result = buildQueryOptions(makeContext({ settingSources: [], memory: false, dreaming: false }))
     const opts = result.options as any
-    expect(opts.settingSources).toBeUndefined()
-    expect(opts.settings).toBeUndefined()
+    expect(opts.settings.autoMemoryEnabled).toBe(false)
+    expect(opts.settings.autoDreamEnabled).toBe(false)
+  })
+
+  it("emits an explicit empty settingSources so the subprocess loads nothing (#634/#490)", () => {
+    const result = buildQueryOptions(makeContext({ settingSources: [] }))
+    expect((result.options as any).settingSources).toEqual([])
+  })
+
+  it("emits explicit empty settingSources when the caller passes none at all", () => {
+    const result = buildQueryOptions(makeContext({ settingSources: undefined }))
+    expect((result.options as any).settingSources).toEqual([])
+  })
+
+  it("honors memory:false in passthrough mode too (#634)", () => {
+    const result = buildQueryOptions(makeContext({ passthrough: true, settingSources: [], memory: false }))
+    const opts = result.options as any
+    expect(opts.settings.autoMemoryEnabled).toBe(false)
+    expect(opts.settingSources).toEqual([])
   })
 
   // sharedMemory env handling — see issue #453 (and upstream

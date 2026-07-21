@@ -107,6 +107,30 @@ describe("SDK param passthrough — body fields", () => {
     expect(capturedOptions.taskBudget).toBeUndefined()
     expect(capturedOptions.betas).toBeUndefined()
   })
+
+  it("forwards reasoning_effort from body (standard OpenAI field)", async () => {
+    const app = createTestApp()
+    await post(app, { ...BASE_BODY, reasoning_effort: "high" })
+    expect(capturedOptions.effort).toBe("high")
+  })
+
+  it("forwards output_config.effort from body (Anthropic-style nesting)", async () => {
+    const app = createTestApp()
+    await post(app, { ...BASE_BODY, output_config: { effort: "xhigh" } })
+    expect(capturedOptions.effort).toBe("xhigh")
+  })
+
+  it("body.effort wins over reasoning_effort", async () => {
+    const app = createTestApp()
+    await post(app, { ...BASE_BODY, effort: "low", reasoning_effort: "max" })
+    expect(capturedOptions.effort).toBe("low")
+  })
+
+  it("drops an invalid reasoning_effort (OpenAI 'minimal') instead of forwarding a value the SDK rejects", async () => {
+    const app = createTestApp()
+    await post(app, { ...BASE_BODY, reasoning_effort: "minimal" })
+    expect(capturedOptions.effort).toBeUndefined()
+  })
 })
 
 // ─── header overrides ─────────────────────────────────────────────────────────
@@ -181,6 +205,24 @@ describe("SDK param passthrough — header overrides", () => {
       "prompt-caching-2024-07-31",
       "context-1m-2025-08-07",
     ])
+  })
+
+  it("drops effort when the thinking beta is stripped (strip-all policy)", async () => {
+    // When interleaved-thinking is stripped, thinking is hard-disabled to keep
+    // thinking blocks out of session state. effort only tunes thinking depth, so
+    // it must be dropped too — otherwise it still reaches the SDK (query.ts) and
+    // can re-trigger reasoning, re-introducing the blocks the strip guards against.
+    process.env.MERIDIAN_BETA_POLICY = "strip-all"
+    try {
+      const app = createTestApp()
+      await post(app, { ...BASE_BODY, effort: "high" }, {
+        "anthropic-beta": "interleaved-thinking-2025-05-14",
+      })
+      expect(capturedOptions.thinking).toEqual({ type: "disabled" })
+      expect(capturedOptions.effort).toBeUndefined()
+    } finally {
+      delete process.env.MERIDIAN_BETA_POLICY
+    }
   })
 
   it("anthropic-beta header is forwarded for api-type profiles", async () => {

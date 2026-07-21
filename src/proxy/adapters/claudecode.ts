@@ -22,6 +22,7 @@ import type { AgentAdapter } from "../adapter"
 import { type FileChange, extractFileChangesFromBash } from "../fileChanges"
 import { normalizeContent } from "../messages"
 import { BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME, ALLOWED_MCP_TOOLS } from "../tools"
+import { resolvePassthrough } from "../../env"
 
 /**
  * Extract Claude Code's client-local working directory from the request's
@@ -50,15 +51,38 @@ function extractClaudeCodeClientCwd(body: any): string | undefined {
   return match?.[1]?.trim() || undefined
 }
 
+/** Extract the stable conversation ID embedded by Claude Code in metadata.user_id. */
+export function extractClaudeCodeSessionId(body: unknown): string | undefined {
+  if (!body || typeof body !== "object") return undefined
+
+  const metadata = (body as { metadata?: unknown }).metadata
+  if (!metadata || typeof metadata !== "object") return undefined
+
+  const rawUserId = (metadata as { user_id?: unknown }).user_id
+  let userMetadata: unknown = rawUserId
+
+  if (typeof rawUserId === "string") {
+    try {
+      userMetadata = JSON.parse(rawUserId)
+    } catch {
+      return undefined
+    }
+  }
+
+  if (!userMetadata || typeof userMetadata !== "object") return undefined
+  const sessionId = (userMetadata as { session_id?: unknown }).session_id
+  return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined
+}
+
 export const claudeCodeAdapter: AgentAdapter = {
   name: "claude-code",
 
   /**
-   * Claude Code doesn't send a session-affinity header, so fall through to
-   * fingerprint-based resume (first-user-message + clientCwd).
+   * Claude Code embeds its conversation ID in metadata.user_id rather than a
+   * session-affinity header. Fall back to fingerprint resume when absent.
    */
-  getSessionId(_c: Context): string | undefined {
-    return undefined
+  getSessionId(_c: Context, body?: unknown): string | undefined {
+    return extractClaudeCodeSessionId(body)
   },
 
   /**
@@ -105,11 +129,7 @@ export const claudeCodeAdapter: AgentAdapter = {
   usesPassthrough(): boolean {
     // Claude Code owns its own tool execution client-side; default to
     // passthrough so tool_use blocks flow back to the CLI.
-    const envVal = process.env.MERIDIAN_PASSTHROUGH ?? process.env.CLAUDE_PROXY_PASSTHROUGH
-    if (envVal === "0" || envVal === "false" || envVal === "no") {
-      return false
-    }
-    return true
+    return resolvePassthrough(true)
   },
 
   supportsThinking(): boolean {

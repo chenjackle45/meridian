@@ -6,9 +6,11 @@
  */
 
 import { join } from "node:path"
-import type { Options, SdkBeta, SettingSource } from "@anthropic-ai/claude-agent-sdk"
+import type { Options, OutputFormat, SdkBeta, SettingSource } from "@anthropic-ai/claude-agent-sdk"
 import { createOpencodeMcpServer } from "../mcpTools"
 import { createPassthroughMcpServer, PASSTHROUGH_MCP_NAME } from "./passthroughTools"
+import { envInt } from "../env"
+import type { Effort } from "./effort"
 
 /**
  * Return a copy of `env` with `CLAUDE_CONFIG_DIR` removed. Used by the
@@ -68,6 +70,10 @@ export interface QueryContext {
   isUndo: boolean
   /** UUID to rollback to for undo operations */
   undoRollbackUuid?: string
+  /** Fork the resumed session instead of attaching to it (#630 busy-session
+   *  fallback — the original stays registered as a bg agent; the fork gets a
+   *  fresh id with the full history). */
+  forkSession?: boolean
   /** SDK hooks (PreToolUse etc.) */
   sdkHooks?: any
   /** Blocked SDK built-in tools (from pipeline) */
@@ -80,12 +86,14 @@ export interface QueryContext {
   allowedMcpTools: readonly string[]
   /** Callback to receive stderr lines from the Claude subprocess */
   onStderr?: (line: string) => void
-  /** Effort level — controls thinking depth (low/medium/high/max) */
-  effort?: 'low' | 'medium' | 'high' | 'max'
+  /** Effort level — controls thinking depth (low/medium/high/xhigh/max) */
+  effort?: Effort
   /** Thinking configuration — adaptive, enabled with budget, or disabled */
   thinking?: { type: 'adaptive' } | { type: 'enabled'; budgetTokens?: number } | { type: 'disabled' }
   /** API-side task budget in tokens — model paces tool use within this limit */
   taskBudget?: { total: number }
+  /** Native JSON-schema output contract for the Claude Agent SDK */
+  outputFormat?: OutputFormat
   /** Beta features to enable */
   betas?: string[]
   /** SDK setting sources — controls CLAUDE.md and user settings loading */
@@ -134,19 +142,31 @@ export interface BuildQueryResult {
  *     thinking + tool_use exhausting the 2-turn budget mid-handoff and returning
  *     500s on fresh (non-resume) requests. See errors.ts sdk_termination
  *     diagnostic + telemetry.
- *   - Resume / deferred (no extra turn over base): both fit within the 3-turn
- *     budget. Resume rehydration and ToolSearch lookups complete inside turn 1.
- *   - Both resume and deferred (+1): a second prelude phase pushes one phase
- *     out, so budget becomes 4.
+ *   - Deferred tools (+1): a ToolSearch discovery is a real model round-trip
+ *     that consumes a turn before the model can emit the real tool_use. The
+ *     old model wrongly assumed a lone deferred set fit in base 3, so the
+ *     discovery ate into the tool-call budget — deferred sessions hit max_turns
+ *     prematurely, forcing cold-cache retries and churn (#547).
+ *   - Resume (+0): rehydration completes inline within turn 1, so it adds no
+ *     turn — a resumed deferred session is 4, same as a fresh deferred one.
  *   - Advisor (+3): server-side advisor executes call + result + final answer.
  */
 function computePassthroughMaxTurns(
-  resumeSessionId: string | undefined,
   hasDeferredTools: boolean,
   advisorModel: string | undefined,
 ): number {
-  const hasResume = !!resumeSessionId
-  const base = hasResume && hasDeferredTools ? 4 : 3
+  const deferredBump = hasDeferredTools ? 1 : 0
+  const defaultBase = 3 + deferredBump
+  // The base is the SDK's internal-loop budget before it must return control.
+  // It's normally enough (the capture path drops re-emitted duplicates and
+  // stops the loop when the model starts repeating), but wide parallel tool
+  // calls — which the SDK surfaces one assistant turn each — can need more
+  // headroom, and orchestration clients hit it on deep chains (#494). Allow
+  // MERIDIAN_PASSTHROUGH_MAX_TURNS / CLAUDE_PROXY_PASSTHROUGH_MAX_TURNS to
+  // raise (or lower) the base (incl. the deferred bump); the advisor bump
+  // below is added on top and is unaffected by the override.
+  const configured = envInt("PASSTHROUGH_MAX_TURNS", defaultBase)
+  const base = configured > 0 ? configured : defaultBase
   const advisorBump = advisorModel ? 3 : 0
   return base + advisorBump
 }
@@ -246,13 +266,13 @@ function resolveSystemPrompt(
   return {}
 }
 
-export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
+export function buildQueryOptions(ctx: QueryContext, abortController?: AbortController): BuildQueryResult {
   const {
     prompt, model, workingDirectory, clientWorkingDirectory, systemContext, claudeExecutable,
     passthrough, stream, sdkAgents, passthroughMcp, cleanEnv, hasDeferredTools,
-    resumeSessionId, isUndo, undoRollbackUuid, sdkHooks, blockedTools, incompatibleTools,
+    resumeSessionId, isUndo, undoRollbackUuid, forkSession, sdkHooks, blockedTools, incompatibleTools,
     mcpServerName, allowedMcpTools, onStderr,
-    effort, thinking, taskBudget, betas, settingSources, codeSystemPrompt, clientSystemPrompt,
+    effort, thinking, taskBudget, outputFormat, betas, settingSources, codeSystemPrompt, clientSystemPrompt,
     memory, dreaming, sharedMemory, maxBudgetUsd, fallbackModel, sdkDebug, additionalDirectories,
   } = ctx
   const cwdNote = buildCwdNote(workingDirectory, clientWorkingDirectory)
@@ -268,11 +288,12 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       // is not in PATH — causing subprocess spawns to fail.
       executable: "node" as const,
       maxTurns: passthrough
-        ? computePassthroughMaxTurns(resumeSessionId, hasDeferredTools, ctx.advisorModel)
+        ? computePassthroughMaxTurns(hasDeferredTools, ctx.advisorModel)
         : 200,
       cwd: workingDirectory,
       model,
       pathToClaudeCodeExecutable: claudeExecutable,
+      ...(abortController ? { abortController } : {}),
       ...(stream ? { includePartialMessages: true } : {}),
       permissionMode: "bypassPermissions" as const,
       allowDangerouslySkipPermissions: true,
@@ -288,18 +309,6 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
             // catalog from the request body. Closes #489 (diagnosis by
             // @albe-jj).
             tools: [],
-            // Explicitly disable claude-code's default settings loading.
-            // Without this, claude-code falls back to its built-in default
-            // (load user + project + local) and slurps CLAUDE.md from the
-            // proxy host's cwd into the system prompt — ~hundreds-to-
-            // thousands of tokens of unintended context that has no
-            // business in chat-style passthrough requests (LiteLLM, custom
-            // chat apps, etc.). Empty array → SDK emits `--setting-sources=`
-            // → subprocess loads nothing. The lower-down `settingSources &&
-            // settingSources.length > 0` block still wins when the user
-            // sets `claudeMd` to "project" or "full" because object spread
-            // order gives the later assignment the final word.
-            settingSources: [],
             disallowedTools: [...allBlockedTools],
             ...(passthroughMcp ? {
               allowedTools: [...passthroughMcp.toolNames],
@@ -312,13 +321,22 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
             mcpServers: { [mcpServerName]: createOpencodeMcpServer() },
           }),
       plugins: [],
-      ...(settingSources && settingSources.length > 0 ? {
-        settingSources,
-        settings: {
-          autoMemoryEnabled: ctx.memory ?? true,
-          autoDreamEnabled: ctx.dreaming ?? false,
-        },
-      } : {}),
+      // #634: `settings` (the --settings flag domain) is independent of
+      // `settingSources` (file domains) — never couple them. The memory
+      // controls must reach the SDK even when no setting files are loaded;
+      // gating them on settingSources silently re-enabled auto-memory (the
+      // SDK's built-in default) whenever claudeMd was "off".
+      settings: {
+        autoMemoryEnabled: ctx.memory ?? true,
+        autoDreamEnabled: ctx.dreaming ?? false,
+      },
+      // #634/#490: always explicit. Empty array → SDK emits
+      // `--setting-sources=` → subprocess loads nothing. Omitting the key
+      // makes claude-code fall back to its built-in default (user + project
+      // + local) and slurp CLAUDE.md from the PROXY HOST's cwd into the
+      // system prompt regardless of claudeMd:"off" — #490 fixed this for
+      // passthrough; this extends the same guarantee to every adapter.
+      settingSources: settingSources ?? [],
       ...(onStderr ? { stderr: onStderr } : {}),
       env: {
         // sharedMemory: the user wants the SDK to use Claude Code's default
@@ -333,6 +351,20 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
         ...(sharedMemory ? stripConfigDir(cleanEnv) : cleanEnv),
         ENABLE_TOOL_SEARCH: hasDeferredTools ? "true" : "false",
         ...(passthrough ? { ENABLE_CLAUDEAI_MCP_SERVERS: "false" } : {}),
+        // Passthrough: suppress the CLI's "# Scratchpad Directory" context
+        // block (#627). It advertises a PROXY-HOST path, but the CLIENT
+        // executes the tools — OpenCode 1.18+ permission-blocks writes to
+        // that alien path (external_directory), dead-ending headless runs.
+        // The CLI skips the block when CLAUDE_CODE_SESSION_KIND=bg — its own
+        // headless-background mode, which is semantically what this
+        // subprocess is. All other "bg" effects are TUI rendering (no TUI
+        // here) or CLAUDE_JOB_DIR-gated bookkeeping (we don't set it) —
+        // audited against the bundled CLI. Kill switch:
+        // MERIDIAN_SUPPRESS_SCRATCHPAD=0. Profile envOverrides spread below
+        // and win if the operator sets an explicit value.
+        ...(passthrough && process.env.MERIDIAN_SUPPRESS_SCRATCHPAD !== "0"
+          ? { CLAUDE_CODE_SESSION_KIND: "bg" }
+          : {}),
         // When running as root (Docker, Unraid, NAS), set IS_SANDBOX=1 to
         // bypass the SDK's root check. Without this, the SDK exits with:
         // "--dangerously-skip-permissions cannot be used with root/sudo"
@@ -342,11 +374,13 @@ export function buildQueryOptions(ctx: QueryContext): BuildQueryResult {
       },
       ...(Object.keys(sdkAgents).length > 0 ? { agents: sdkAgents } : {}),
       ...(resumeSessionId ? { resume: resumeSessionId } : {}),
-      ...(isUndo ? { forkSession: true, ...(undoRollbackUuid ? { resumeSessionAt: undoRollbackUuid } : {}) } : {}),
+      ...(isUndo || forkSession ? { forkSession: true } : {}),
+      ...(isUndo && undoRollbackUuid ? { resumeSessionAt: undoRollbackUuid } : {}),
       ...(sdkHooks ? { hooks: sdkHooks } : {}),
       ...(effort ? { effort } : {}),
       ...(thinking ? { thinking } : {}),
       ...(taskBudget ? { taskBudget } : {}),
+      ...(outputFormat ? { outputFormat } : {}),
       ...(betas && betas.length > 0 ? { betas: betas as SdkBeta[] } : {}),
       ...(maxBudgetUsd && maxBudgetUsd > 0 ? { maxBudgetUsd } : {}),
       ...(fallbackModel ? { fallbackModel } : {}),

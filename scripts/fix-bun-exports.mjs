@@ -13,6 +13,8 @@
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { glob } from "glob";
 
 /**
@@ -39,7 +41,7 @@ export function patchSource(src) {
   //    e.g. import { __INVALID__REF__ } from "./server.js";
   out = out.replace(
     /^import\s*\{\s*__INVALID__REF__\s*\}\s*from\s*"[^"]*"\s*;?\s*\n?/gm,
-    "",
+    ""
   );
 
   // 2. Find all export blocks (both single-line and multi-line).
@@ -57,36 +59,25 @@ export function patchSource(src) {
     // the newline before `}` and produced output like `realThing};`.
     if (blocks[0][0].includes("__INVALID__REF__")) {
       const symbols = extractExportSymbols(blocks[0][0]);
-      const cleaned =
-        symbols.length > 0 ? `export {\n  ${symbols.join(",\n  ")}\n};` : "";
+      const cleaned = symbols.length > 0
+        ? `export {\n  ${symbols.join(",\n  ")}\n};`
+        : "";
       out = out.replace(blocks[0][0], cleaned);
     }
 
-    // Remove subsequent blocks whose real symbols are all in the canonical set
+    // Deduplicate subsequent blocks against the canonical set
     for (let i = blocks.length - 1; i >= 1; i--) {
       const block = blocks[i][0];
       const symbols = extractExportSymbols(block);
-      if (symbols.length === 0) {
+      const novel = symbols.filter((s) => !canonicalSymbols.has(s));
+      if (novel.length === 0) {
         out = out.replace(block, "");
-        continue;
-      }
-      const newSymbols = symbols.filter((s) => !canonicalSymbols.has(s));
-      if (newSymbols.length === 0) {
-        // All duplicates — drop the block entirely.
-        out = out.replace(block, "");
-      } else if (newSymbols.length < symbols.length) {
-        // Partial overlap — rewrite with only the new symbols and absorb them
-        // into the canonical set so later blocks dedup against them too.
-        // Without this branch Bun's split chunks emit redundant symbols across
-        // multiple `export {}` blocks and Node throws SyntaxError: Duplicate
-        // export at module load.
-        const cleaned = `export { ${newSymbols.join(", ")} };`;
+      } else if (novel.length < symbols.length) {
+        const cleaned = `export { ${novel.join(", ")} };`;
         out = out.replace(block, cleaned);
-        for (const s of newSymbols) canonicalSymbols.add(s);
+        for (const s of novel) canonicalSymbols.add(s);
       } else {
-        // Fully new symbols — leave the block untouched but absorb so later
-        // blocks dedup against it.
-        for (const s of newSymbols) canonicalSymbols.add(s);
+        for (const s of symbols) canonicalSymbols.add(s);
       }
     }
   }
@@ -105,7 +96,7 @@ export async function fixBunExports(distDir) {
   const files = await glob("**/*.js", { cwd: distDir });
   let totalFixed = 0;
   for (const rel of files) {
-    const path = distDir + rel;
+    const path = join(distDir, rel);
     const src = readFileSync(path, "utf-8");
     const out = patchSource(src);
     if (out !== src) {
@@ -118,8 +109,9 @@ export async function fixBunExports(distDir) {
 }
 
 // CLI entry — only runs when invoked directly, not when imported by tests.
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const distDir = new URL("../dist/", import.meta.url).pathname;
+const __filename = fileURLToPath(import.meta.url);
+if (process.argv[1] && resolve(process.argv[1]) === __filename) {
+  const distDir = resolve(dirname(__filename), "..", "dist");
   const totalFixed = await fixBunExports(distDir);
   if (totalFixed > 0) {
     console.log(`fix-bun-exports: patched ${totalFixed} file(s)`);

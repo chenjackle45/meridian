@@ -70,6 +70,27 @@ const ADAPTER_DEFAULTS: Record<string, Partial<AdapterFeatures>> = {
   passthrough: {
     codeSystemPrompt: false,
   },
+  // The OpenAI-compatible endpoint (/v1/chat/completions) serves generic chat
+  // clients (Open WebUI, LibreChat, curl) that bring their own system prompt.
+  // Default the claude_code preset OFF so their prompt isn't overridden by the
+  // ~28KB Claude Code persona (same rationale as passthrough). Users can flip
+  // it on via the settings UI for explicit opt-in.
+  openai: {
+    codeSystemPrompt: false,
+  },
+  // Cherry Studio is a chat client that brings its own system prompt. Default
+  // the ~28KB Claude Code preset OFF (same rationale as openai/passthrough) so
+  // its prompt isn't overridden. WebSearch still works without the preset
+  // (verified). Users can flip it on via the settings UI.
+  cherry: {
+    codeSystemPrompt: false,
+  },
+  // Codex CLI endpoint (/v1/responses). Codex ships its own ~21KB harness
+  // instructions; keep the Claude Code preset OFF so they aren't overridden
+  // (same rationale as openai). Passthrough is forced in the adapter itself.
+  codex: {
+    codeSystemPrompt: false,
+  },
 }
 
 function getConfigPath(): string {
@@ -130,10 +151,28 @@ export function getFeaturesForAdapter(adapterName: string): AdapterFeatures {
 }
 
 /**
+ * Returns the thinking value the user has *explicitly* configured for an
+ * adapter, or undefined when none is set (i.e. it falls back to defaults).
+ *
+ * The merged result from getFeaturesForAdapter() can't tell an explicit
+ * "disabled" choice apart from the default "disabled" (DEFAULT_FEATURES.thinking
+ * is "disabled"). Those two cases must behave differently: an explicit
+ * "disabled" is an authoritative "no thinking" instruction that overrides client
+ * requests, whereas the default "disabled" is a no-op fallback so clients can
+ * still request thinking per-request. See the thinking resolution in server.ts.
+ */
+export function getExplicitThinking(adapterName: string): AdapterFeatures["thinking"] | undefined {
+  const explicit = readConfig()[adapterName]?.thinking
+  return typeof explicit === "string" && VALID_THINKING_VALUES.has(explicit)
+    ? (explicit as AdapterFeatures["thinking"])
+    : undefined
+}
+
+/**
  * Get the full config for all adapters (for the settings UI).
  */
 export function getAllFeatureConfigs(): Record<string, AdapterFeatures> {
-  const adapters = ["opencode", "crush", "forgecode", "pi", "droid", "passthrough"]
+  const adapters = ["opencode", "crush", "forgecode", "pi", "droid", "passthrough", "openai", "codex"]
   const result: Record<string, AdapterFeatures> = {}
   for (const name of adapters) {
     result[name] = getFeaturesForAdapter(name)

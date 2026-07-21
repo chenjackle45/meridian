@@ -14,7 +14,8 @@
  * issuing a second network request and racing on the write.
  */
 
-import { execFile as execFileCb } from "child_process"
+import { execFile as execFileCb } from "node:child_process"
+import { createHash } from "node:crypto"
 import {
   closeSync,
   existsSync,
@@ -28,11 +29,10 @@ import {
   rmdirSync,
   unlinkSync,
   writeSync,
-} from "fs"
-import { homedir, platform, userInfo } from "os"
-import { basename, join, dirname, resolve } from "path"
-import { createHash } from "crypto"
-import { promisify } from "util"
+} from "node:fs"
+import { homedir, platform, userInfo } from "node:os"
+import { basename, dirname, join, resolve } from "node:path"
+import { promisify } from "node:util"
 import { claudeLog } from "../logger"
 
 const execFile = promisify(execFileCb)
@@ -86,6 +86,8 @@ interface CredentialsFile {
 // ---------------------------------------------------------------------------
 
 export interface CredentialStore {
+  /** Stable identity for in-flight refresh deduplication across store instances. */
+  refreshKey?: string
   read(): Promise<CredentialsFile | null>
   write(credentials: CredentialsFile): Promise<boolean>
   /** PATCHED: NoWayLM — file-backed store 暴露路徑，refresh 據此對 host 共用 lock 上鎖。 */
@@ -269,6 +271,8 @@ const keychainWasHexByService = new Map<string, boolean>()
 
 function buildMacosStore(serviceName: string): CredentialStore {
   return {
+    refreshKey: `keychain:${serviceName}`,
+
     async read() {
       try {
         const { stdout } = await execFile(
@@ -313,13 +317,16 @@ const macosStore: CredentialStore = buildMacosStore(KEYCHAIN_SERVICE)
 // ---------------------------------------------------------------------------
 
 function buildFileStore(filePath: string): CredentialStore {
+  const absPath = resolve(filePath)
   return {
+    refreshKey: `file:${absPath}`,
+
     async read() {
       try {
-        if (!existsSync(filePath)) return null
-        return JSON.parse(readFileSync(filePath, "utf-8")) as CredentialsFile
+        if (!existsSync(absPath)) return null
+        return JSON.parse(readFileSync(absPath, "utf-8")) as CredentialsFile
       } catch (err) {
-        claudeLog("token_refresh.file_read_failed", { path: filePath, error: String(err) })
+        claudeLog("token_refresh.file_read_failed", { path: absPath, error: String(err) })
         return null
       }
     },
@@ -332,8 +339,8 @@ function buildFileStore(filePath: string): CredentialStore {
       let temporaryFd: number | null = null
       try {
         // Ensure parent dir exists for non-default paths.
-        mkdirSync(dirname(filePath), { recursive: true })
-        const targetPath = resolveCredentialTargetPath(filePath)
+        mkdirSync(dirname(absPath), { recursive: true })
+        const targetPath = resolveCredentialTargetPath(absPath)
         temporaryPath = join(dirname(targetPath), buildCredentialTempName())
         temporaryFd = openSync(temporaryPath, "wx", 0o600)
         commitSerializedCredentials(temporaryFd, temporaryPath, targetPath, serializeCredentials(credentials))
@@ -341,7 +348,7 @@ function buildFileStore(filePath: string): CredentialStore {
         temporaryPath = null
         return true
       } catch (err) {
-        claudeLog("token_refresh.file_write_failed", { path: filePath, error: String(err) })
+        claudeLog("token_refresh.file_write_failed", { path: absPath, error: String(err) })
         if (temporaryFd !== null) {
           try {
             closeSync(temporaryFd)
@@ -356,7 +363,7 @@ function buildFileStore(filePath: string): CredentialStore {
       }
     },
 
-    credentialFilePath: filePath,
+    credentialFilePath: absPath,
   }
 }
 
@@ -395,8 +402,9 @@ export function credentialsFilePathForProfile(claudeConfigDir?: string): string 
 // OAuth refresh
 // ---------------------------------------------------------------------------
 
-/** In-flight refresh promise — deduplicates concurrent callers. */
-let inflightRefresh: Promise<boolean> | null = null
+/** In-flight refresh promises — deduplicates concurrent callers per credential store. */
+const inflightRefreshByKey = new Map<string, Promise<boolean>>()
+const inflightRefreshByStore = new WeakMap<CredentialStore, Promise<boolean>>()
 
 /**
  * Refresh the Claude Code OAuth access token.
@@ -413,13 +421,27 @@ export async function refreshOAuthToken(
   store?: CredentialStore,
   lockWaitMs = CREDENTIAL_LOCK_WAIT_MS,
 ): Promise<boolean> {
-  if (inflightRefresh) return inflightRefresh
+  const s = store ?? createPlatformCredentialStore()
+  const refreshKey = s.refreshKey
+  if (refreshKey) {
+    const inflight = inflightRefreshByKey.get(refreshKey)
+    if (inflight) return inflight
 
-  inflightRefresh = doRefresh(store ?? createPlatformCredentialStore(), lockWaitMs).finally(() => {
-    inflightRefresh = null
+    const refresh = doRefresh(s, lockWaitMs).finally(() => {
+      inflightRefreshByKey.delete(refreshKey)
+    })
+    inflightRefreshByKey.set(refreshKey, refresh)
+    return refresh
+  }
+
+  const inflight = inflightRefreshByStore.get(s)
+  if (inflight) return inflight
+
+  const refresh = doRefresh(s, lockWaitMs).finally(() => {
+    inflightRefreshByStore.delete(s)
   })
-
-  return inflightRefresh
+  inflightRefreshByStore.set(s, refresh)
+  return refresh
 }
 
 // PATCHED: NoWayLM — 判斷「等待期間別的 writer 是否已完成 refresh」：refresh token 已
@@ -803,13 +825,15 @@ async function scheduleNext(
     const ok = await refreshOAuthToken(store)
     if (!scheduledRefreshActive || gen !== scheduledRefreshGeneration) return
     claudeLog("token_refresh.scheduled", { ok, immediate: true })
-    console.error(`[token_refresh] scheduled refresh (immediate) ok=${ok}`)
     armTimer(ok ? 0 : failureRetryMs, store, bufferMs, failureRetryMs, gen)
     return
   }
 
   armTimer(dueIn, store, bufferMs, failureRetryMs, gen)
 }
+
+/** Largest delay setTimeout accepts before Node clamps it to 1ms (2^31 - 1). */
+const MAX_TIMEOUT_MS = 2_147_483_647
 
 function armTimer(
   delayMs: number,
@@ -818,14 +842,22 @@ function armTimer(
   failureRetryMs: number,
   gen: number,
 ): void {
+  // A token lifetime beyond ~24.8 days produces a delay above the 32-bit
+  // signed max. Node then clamps it to 1ms and emits TimeoutOverflowWarning;
+  // the 1ms timer fires, scheduleNext recomputes the same huge delay, and it
+  // loops forever (#515). Cap the delay — the callback re-runs scheduleNext,
+  // which recomputes the remaining time and arms the next (also-capped) timer.
+  const safeDelayMs = delayMs > MAX_TIMEOUT_MS ? MAX_TIMEOUT_MS : delayMs
   scheduledRefreshTimer = setTimeout(async () => {
     if (!scheduledRefreshActive || gen !== scheduledRefreshGeneration) return
     // The dueIn re-check inside scheduleNext distinguishes "fire-now" from
-    // "reschedule-only" ticks: when the disk-state recompute lands inside
-    // the buffer window, scheduleNext emits the immediate-refresh log line;
-    // otherwise it just arms the next timer silently.
+    // "reschedule-only" ticks: when the disk-state recompute lands inside the
+    // buffer window, scheduleNext fires a refresh and emits the debug-gated
+    // `token_refresh.scheduled` telemetry; otherwise it just arms the next
+    // timer. Neither path writes to stderr (the unconditional log was removed
+    // in #518 to stop polluting embedded TUI hosts).
     void scheduleNext(store, bufferMs, failureRetryMs, gen)
-  }, delayMs)
+  }, safeDelayMs)
   if (scheduledRefreshTimer && (scheduledRefreshTimer as { unref?: () => void }).unref) {
     (scheduledRefreshTimer as { unref: () => void }).unref()
   }
@@ -838,5 +870,5 @@ export function isBackgroundRefreshActive(): boolean {
 
 /** Reset in-flight state — for testing only. */
 export function resetInflightRefresh(): void {
-  inflightRefresh = null
+  inflightRefreshByKey.clear()
 }

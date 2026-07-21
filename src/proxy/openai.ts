@@ -20,6 +20,8 @@
 // Types
 // ---------------------------------------------------------------------------
 
+import { CANONICAL_SONNET_MODEL } from "./models"
+
 export type OpenAiRole = "system" | "user" | "assistant" | "tool"
 
 export interface OpenAiTextPart {
@@ -74,6 +76,11 @@ export interface OpenAiChatRequest {
   temperature?: number
   top_p?: number
   tools?: OpenAiChatTool[]
+  /** Standard OpenAI reasoning level (low/medium/high/…). */
+  reasoning_effort?: string
+  /** Anthropic-style nesting some clients use. */
+  output_config?: { effort?: string }
+  stream_options?: { include_usage?: boolean }
 }
 
 export interface AnthropicTextBlock {
@@ -111,6 +118,12 @@ export interface AnthropicRequestBody {
   temperature?: number
   top_p?: number
   tools?: AnthropicTool[]
+  /** Tool selection constraint (carried from Responses `tool_choice`, #475). */
+  tool_choice?: { type: "auto" | "any" | "tool"; name?: string }
+  /** Reasoning effort carried from the OpenAI request so the internal
+   *  /v1/messages hop forwards it to the SDK (value gated by normalizeEffort). */
+  reasoning_effort?: string
+  output_config?: { effort?: string }
 }
 
 export interface AnthropicUsage {
@@ -189,6 +202,7 @@ export interface OpenAiStreamChunk {
     }
     finish_reason: "stop" | "length" | "tool_calls" | null
   }>
+  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number }
 }
 
 export interface OpenAiCompletionFunctionToolCall {
@@ -231,6 +245,47 @@ export interface OpenAiCompletion {
   }
 }
 
+/** A single capability flag, matching the Anthropic Models API. */
+interface CapabilitySupport {
+  supported: boolean
+}
+
+/**
+ * Model capability information, mirroring the Anthropic `GET /v1/models`
+ * `capabilities` object. Clients (e.g. Home Assistant's Anthropic integration)
+ * read these fields — notably `image_input` — to decide which content types a
+ * model accepts (#498).
+ */
+export interface ModelCapabilities {
+  batch: CapabilitySupport
+  citations: CapabilitySupport
+  code_execution: CapabilitySupport
+  context_management: {
+    clear_thinking_20251015: CapabilitySupport
+    clear_tool_uses_20250919: CapabilitySupport
+    compact_20260112: CapabilitySupport
+    supported: boolean
+  }
+  effort: {
+    high: CapabilitySupport
+    low: CapabilitySupport
+    max: CapabilitySupport
+    medium: CapabilitySupport
+    xhigh: CapabilitySupport
+    supported: boolean
+  }
+  image_input: CapabilitySupport
+  pdf_input: CapabilitySupport
+  structured_outputs: CapabilitySupport
+  thinking: {
+    supported: boolean
+    types: {
+      adaptive: CapabilitySupport
+      enabled: CapabilitySupport
+    }
+  }
+}
+
 export interface OpenAiModel {
   id: string
   object: "model"
@@ -238,6 +293,7 @@ export interface OpenAiModel {
   owned_by: string
   display_name: string
   context_window: number
+  capabilities?: ModelCapabilities
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +525,7 @@ export function translateOpenAiToAnthropic(body: OpenAiChatRequest): AnthropicRe
   }
 
   const result: AnthropicRequestBody = {
-    model: body.model ?? "claude-sonnet-4-6",
+    model: body.model ?? CANONICAL_SONNET_MODEL,
     messages: messagesToSend,
     max_tokens: body.max_tokens ?? body.max_completion_tokens ?? 8192,
     tools: tools,
@@ -479,6 +535,12 @@ export function translateOpenAiToAnthropic(body: OpenAiChatRequest): AnthropicRe
   if (systemPrompt) result.system = systemPrompt
   if (body.temperature !== undefined) result.temperature = body.temperature
   if (body.top_p !== undefined) result.top_p = body.top_p
+  // Carry the reasoning level through so the internal /v1/messages hop can
+  // forward it to the SDK. Without this it's dropped at the endpoint boundary
+  // and OpenAI clients always run at the model default. Validation happens
+  // downstream via normalizeEffort.
+  if (body.reasoning_effort !== undefined) result.reasoning_effort = body.reasoning_effort
+  if (body.output_config?.effort !== undefined) result.output_config = { effort: body.output_config.effort }
 
   return result
 }
@@ -587,10 +649,12 @@ export interface AnthropicSseEvent {
     | { type: "thinking"; thinking?: string }
     | AnthropicToolUseBlock
   message?: { id?: string }
+  usage?: AnthropicUsage
 }
 
 export interface SseTranslator {
   (event: AnthropicSseEvent): OpenAiStreamChunk | null
+  buildUsageChunk(): OpenAiStreamChunk | null
 }
 
 export interface SseTranslatorContext {
@@ -599,6 +663,7 @@ export interface SseTranslatorContext {
   created: number
   /** When false, thinking blocks are stripped from the response */
   thinkingPassthrough?: boolean
+  includeUsage?: boolean
 }
 
 /**
@@ -615,7 +680,9 @@ export interface SseTranslatorContext {
  */
 export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
   let toolCallIndex = -1 // -1 means "no tools used yet", becomes 0 on first block
-  return (event) => {
+  let lastUsage: AnthropicUsage | undefined
+
+  const translate = ((event: AnthropicSseEvent) => {
     // Increment must use the same condition the pure translator uses to
     // decide a tool-start chunk gets emitted, otherwise indexes drift if a
     // malformed event is skipped.
@@ -627,6 +694,10 @@ export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
       toolCallIndex++
     }
 
+    if (event.type === "message_delta" && event.usage) {
+      lastUsage = event.usage
+    }
+
     return translateAnthropicSseEvent(
       event,
       ctx.completionId,
@@ -635,7 +706,27 @@ export function createSseTranslator(ctx: SseTranslatorContext): SseTranslator {
       toolCallIndex,
       ctx.thinkingPassthrough,
     )
+  }) as SseTranslator
+
+  translate.buildUsageChunk = () => {
+    if (!ctx.includeUsage || !lastUsage) return null
+    const promptTokens = lastUsage.input_tokens ?? 0
+    const completionTokens = lastUsage.output_tokens ?? 0
+    return {
+      id: ctx.completionId,
+      object: "chat.completion.chunk",
+      created: ctx.created,
+      model: ctx.model,
+      choices: [],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+      },
+    }
   }
+
+  return translate
 }
 
 /**
@@ -787,6 +878,32 @@ export function translateAnthropicSseEvent(
 // Model list
 // ---------------------------------------------------------------------------
 
+const yes: CapabilitySupport = { supported: true }
+
+/**
+ * Capability set shared by every model we expose. All are modern Claude
+ * 4.6+/5 models with the full feature set (vision, PDF, tools, thinking,
+ * effort, context management, structured outputs), so the Anthropic Models
+ * API reports every field as supported for them (verified against the live
+ * `GET /v1/models` response). Frozen so callers can't mutate the shared value.
+ */
+const FULL_CAPABILITIES: ModelCapabilities = Object.freeze({
+  batch: yes,
+  citations: yes,
+  code_execution: yes,
+  context_management: {
+    clear_thinking_20251015: yes,
+    clear_tool_uses_20250919: yes,
+    compact_20260112: yes,
+    supported: true,
+  },
+  effort: { high: yes, low: yes, max: yes, medium: yes, xhigh: yes, supported: true },
+  image_input: yes,
+  pdf_input: yes,
+  structured_outputs: yes,
+  thinking: { supported: true, types: { adaptive: yes, enabled: yes } },
+})
+
 /**
  * Return the static list of available Claude models in OpenAI format.
  * Context windows reflect subscription capabilities.
@@ -794,12 +911,22 @@ export function translateAnthropicSseEvent(
 export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date.now() / 1000)): OpenAiModel[] {
   return [
     {
+      id: "claude-sonnet-5",
+      object: "model",
+      created: now,
+      owned_by: "anthropic",
+      display_name: "Claude Sonnet 5",
+      context_window: 200_000,
+      capabilities: FULL_CAPABILITIES,
+    },
+    {
       id: "claude-sonnet-4-6",
       object: "model",
       created: now,
       owned_by: "anthropic",
       display_name: "Claude Sonnet 4.6",
       context_window: 200_000,
+      capabilities: FULL_CAPABILITIES,
     },
     {
       id: "claude-opus-4-6",
@@ -808,6 +935,7 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       owned_by: "anthropic",
       display_name: "Claude Opus 4.6",
       context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      capabilities: FULL_CAPABILITIES,
     },
     {
       id: "claude-opus-4-7",
@@ -816,6 +944,7 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       owned_by: "anthropic",
       display_name: "Claude Opus 4.7",
       context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      capabilities: FULL_CAPABILITIES,
     },
     {
       id: "claude-opus-4-8",
@@ -824,6 +953,16 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       owned_by: "anthropic",
       display_name: "Claude Opus 4.8",
       context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      capabilities: FULL_CAPABILITIES,
+    },
+    {
+      id: "claude-fable-5",
+      object: "model",
+      created: now,
+      owned_by: "anthropic",
+      display_name: "Claude Fable 5",
+      context_window: isMaxSubscription ? 1_000_000 : 200_000,
+      capabilities: FULL_CAPABILITIES,
     },
     {
       id: "claude-haiku-4-5",
@@ -832,6 +971,7 @@ export function buildModelList(isMaxSubscription: boolean, now = Math.floor(Date
       owned_by: "anthropic",
       display_name: "Claude Haiku 4.5",
       context_window: 200_000,
+      capabilities: FULL_CAPABILITIES,
     },
   ]
 }

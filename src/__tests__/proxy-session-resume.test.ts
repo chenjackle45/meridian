@@ -199,6 +199,47 @@ describe("Session resume: session ID tracking", () => {
     // Should NOT have resume set (different session)
     expect(capturedQueryParams.options.resume).toBeUndefined()
   })
+
+  it("resumes Claude Code after a tool_result using metadata session ID", async () => {
+    const app = createTestApp()
+    const metadata = {
+      user_id: JSON.stringify({
+        device_id: "device-1",
+        account_uuid: "",
+        session_id: "claude-code-session-1",
+      }),
+    }
+    const headers = { "user-agent": "claude-cli/2.1.207" }
+
+    await (await post(app, {
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      stream: false,
+      metadata,
+      messages: [{ role: "user", content: "Run the tests" }],
+    }, headers)).json()
+
+    mockMessages = [assistantMessage([{ type: "text", text: "The test failed." }])]
+    await (await post(app, {
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      stream: false,
+      metadata,
+      messages: [
+        { role: "user", content: "Run the tests" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "npm test" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "Exit code 1" }],
+        },
+      ],
+    }, headers)).json()
+
+    expect(capturedQueryParams.options.resume).toBe(MOCK_SDK_SESSION)
+  })
 })
 
 // ============================================================
@@ -241,6 +282,37 @@ describe("Session resume: fingerprint fallback", () => {
         { role: "user", content: "Tell me more" },
       ],
     })).json()
+
+    expect(capturedQueryParams.options.resume).toBe(MOCK_SDK_SESSION)
+  })
+
+  it("keeps Claude Code fingerprint resume for tool_result without metadata", async () => {
+    const app = createTestApp()
+    const headers = { "user-agent": "claude-cli/2.1.207" }
+
+    await (await post(app, {
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      stream: false,
+      messages: [{ role: "user", content: "Check the build" }],
+    }, headers)).json()
+
+    await (await post(app, {
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      stream: false,
+      messages: [
+        { role: "user", content: "Check the build" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_2", name: "Bash", input: { command: "npm run build" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_2", content: "Build complete" }],
+        },
+      ],
+    }, headers)).json()
 
     expect(capturedQueryParams.options.resume).toBe(MOCK_SDK_SESSION)
   })

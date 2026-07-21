@@ -332,3 +332,94 @@ describe("dirsToRemoveOnProfileRemove", () => {
     expect(dirs).toEqual([])
   })
 })
+
+describe("profile auth login env", () => {
+  test("sets CLAUDE_CONFIG_DIR without forcing browser behavior by default", async () => {
+    const { buildAuthLoginEnv } = await import("../proxy/profileCli")
+    const env = buildAuthLoginEnv("/tmp/profile", {}, { PATH: "/usr/bin", BROWSER: "open" })
+
+    expect(env.CLAUDE_CONFIG_DIR).toBe("/tmp/profile")
+    expect(env.BROWSER).toBe("open")
+  })
+
+  test("headless OAuth login builds a manual PKCE authorization URL", async () => {
+    const { createManualOAuthSession } = await import("../proxy/profileCli")
+    const session = createManualOAuthSession()
+    const url = new URL(session.authorizeUrl)
+
+    expect(url.origin).toBe("https://claude.com")
+    expect(url.pathname).toBe("/cai/oauth/authorize")
+    expect(url.searchParams.get("code")).toBe("true")
+    expect(url.searchParams.get("client_id")).toBe("9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+    expect(url.searchParams.get("redirect_uri")).toBe("https://platform.claude.com/oauth/code/callback")
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256")
+    expect(url.searchParams.get("code_challenge")).toBeTruthy()
+    expect(session.codeVerifier).toBeTruthy()
+    expect(session.state).toBeTruthy()
+  })
+
+  test("parses pasted authorization code values", async () => {
+    const { parseAuthorizationCodeInput } = await import("../proxy/profileCli")
+
+    expect(parseAuthorizationCodeInput("abc123")).toEqual({ code: "abc123" })
+    expect(parseAuthorizationCodeInput("abc123#state456")).toEqual({ code: "abc123", state: "state456" })
+    expect(parseAuthorizationCodeInput("https://platform.claude.com/oauth/code/callback?code=abc123&state=state456")).toEqual({ code: "abc123", state: "state456" })
+  })
+})
+
+describe("resolveProfile — sticky routing (#383)", () => {
+  const profiles: ProfileConfig[] = [
+    { id: "personal", type: "claude-max", claudeConfigDir: "/p" },
+    { id: "work", type: "claude-max", claudeConfigDir: "/w" },
+  ]
+  const opts = (key?: string, mode?: "active" | "sticky") => ({ stickySessionKey: key, routingMode: mode })
+
+  test("GOLDEN: without routing options the chain is unchanged (header > active > default > first)", () => {
+    expect(resolveProfile(profiles, undefined).id).toBe("personal")
+    expect(resolveProfile(profiles, "work").id).toBe("work")
+    expect(resolveProfile(profiles, "personal", "work").id).toBe("work")
+    setActiveProfile("work")
+    expect(resolveProfile(profiles, "personal").id).toBe("work")
+  })
+
+  test("GOLDEN: routingMode 'active' with a session key is identical to today", () => {
+    setActiveProfile("personal")
+    expect(resolveProfile(profiles, undefined, undefined, opts("sess-a", "active")).id).toBe("personal")
+  })
+
+  test("sticky: same session key always resolves the same profile", () => {
+    const first = resolveProfile(profiles, undefined, undefined, opts("sess-a", "sticky")).id
+    for (let i = 0; i < 5; i++) {
+      expect(resolveProfile(profiles, undefined, undefined, opts("sess-a", "sticky")).id).toBe(first)
+    }
+  })
+
+  test("sticky: distributes different sessions across profiles", () => {
+    const seen = new Set<string>()
+    for (let i = 0; i < 50; i++) {
+      seen.add(resolveProfile(profiles, undefined, undefined, opts(`sess-${i}`, "sticky")).id)
+    }
+    expect(seen.size).toBe(2)
+  })
+
+  test("sticky: explicit header STILL wins over the sticky assignment", () => {
+    // sess-a hashes to "work" (pinned) — the header must override it.
+    expect(resolveProfile(profiles, undefined, "personal", opts("sess-a", "sticky")).id).toBe("personal")
+  })
+
+  test("sticky: beats the active profile (that's the point of the mode)", () => {
+    setActiveProfile("personal")
+    expect(resolveProfile(profiles, undefined, undefined, opts("sess-a", "sticky")).id).toBe("work")
+  })
+
+  test("sticky: no session key falls through to the normal chain", () => {
+    setActiveProfile("work")
+    expect(resolveProfile(profiles, undefined, undefined, opts(undefined, "sticky")).id).toBe("work")
+  })
+
+  test("sticky: no profiles configured stays in single-account mode", () => {
+    const r = resolveProfile(undefined, undefined, undefined, opts("sess-a", "sticky"))
+    expect(r.id).toBe("default")
+    expect(r.env).toEqual({})
+  })
+})

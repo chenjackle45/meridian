@@ -57,6 +57,7 @@ src/
 │   ├── profileCli.ts          ← CLI commands for profile management (leaf, I/O)
 │   ├── agentDefs.ts           ← Subagent definition extraction from tool descriptions
 │   ├── agentMatch.ts          ← Fuzzy agent name matching
+│   ├── design.ts              ← Claude Design MCP proxy (token store/refresh, auth precedence, login flow)
 │   └── passthroughTools.ts    ← Tool forwarding mode (agent handles execution)
 ├── fileChanges.ts             ← PostToolUse hook: tracks write/edit ops, formats summary
 ├── mcpTools.ts                ← MCP tool definitions (read, write, edit, bash, glob, grep)
@@ -69,6 +70,8 @@ src/
 │   ├── routes.ts              ← Telemetry API endpoints
 │   ├── logStore.ts            ← Diagnostic log ring buffer
 │   ├── dashboard.ts           ← HTML dashboard
+│   ├── pricing.ts             ← Static API list prices + cost estimation (pure)
+│   ├── pricingStore.ts        ← User pricing overrides (persisted JSON)
 │   ├── profileBar.ts          ← Shared profile switcher bar (injected into HTML pages)
 │   ├── profilePage.ts         ← Profile management page HTML
 │   └── types.ts               ← Telemetry types

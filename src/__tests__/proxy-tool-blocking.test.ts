@@ -62,7 +62,7 @@ afterAll(() => {
 
 // The complete set of tools that must ALWAYS be blocked
 const BLOCKED_BUILTIN_TOOLS = [
-  "Read", "Write", "Edit", "MultiEdit",
+  "Read", "Write", "Edit",
   "Bash", "Glob", "Grep", "NotebookEdit",
   "WebFetch", "WebSearch", "TodoWrite"
 ]

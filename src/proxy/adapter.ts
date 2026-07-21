@@ -21,7 +21,7 @@ export interface AgentIdentity {
    * Extract a session ID from the request.
    * Returns undefined if the agent doesn't provide session tracking.
    */
-  getSessionId(c: Context): string | undefined
+  getSessionId(c: Context, body?: unknown): string | undefined
 
   /**
    * Extract the SDK subprocess working directory from the request body.
@@ -75,6 +75,21 @@ export interface AgentIdentity {
  * how to interact with the calling agent.
  */
 export interface AgentAdapter extends AgentIdentity {
+  /**
+   * For adapter INSTANCES (#476): the base adapter's name. Behavior keyed by
+   * adapter name — transforms, plugin scoping, agent-specific branches —
+   * must resolve via `baseName ?? name` so existing transforms/plugins keep
+   * applying to instances. Features resolve by instance definition instead.
+   * Undefined for built-in adapters.
+   */
+  readonly baseName?: string
+
+  /** Instance feature overrides, layered over the base's resolved features. */
+  readonly instanceFeatures?: Partial<import("./sdkFeatures").AdapterFeatures>
+
+  /** Instance passthrough override — beats the adapter transform's default. */
+  readonly instancePassthrough?: boolean
+
   /**
    * SDK built-in tools to block (replaced by MCP equivalents).
    * These are tools where the agent provides its own implementation.

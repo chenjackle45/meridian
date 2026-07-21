@@ -47,6 +47,13 @@ OpenCode-specific behavior is documented in `ARCHITECTURE.md` under "Agent-Speci
 - Match existing patterns — check neighboring code before writing
 - Keep `server.ts` as thin as possible — it should orchestrate, not compute
 
+### Design (web UI + brand assets)
+
+- **All user-facing surfaces follow [`DESIGN.md`](./DESIGN.md)** — the full design language (palette, chrome, components, principles).
+- Color tokens come from `themeCss` in `src/telemetry/profileBar.ts`; never hardcode hex colors in page CSS.
+- Every page embeds the shared site header (`profileBarCss/Html/Js`) and must not set its own `body` background.
+- Blue (`--accent`) = interactive/active; violet (`--accent2`) = code/meta/brand-secondary — never swap these roles.
+
 ## Architecture Quick Reference
 
 ```
@@ -61,6 +68,7 @@ models.ts          → mapModelToClaudeModel, resolveClaudeExecutableAsync
 tools.ts           → BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, MCP_SERVER_NAME
 messages.ts        → normalizeContent, getLastUserMessage (pure)
 fileChanges.ts     → PostToolUse hook: file write/edit tracking + summary formatting (pure)
+design.ts          → Claude Design MCP proxy: token store/refresh, auth precedence, login flow
 session/
   lineage.ts       → Hashing, lineage verification (PURE — no I/O)
   fingerprint.ts   → extractClientCwd, getConversationFingerprint

@@ -3,11 +3,17 @@ import { extractFileChangesFromBash, type FileChange } from "../fileChanges"
 import { BLOCKED_BUILTIN_TOOLS, CLAUDE_CODE_ONLY_TOOLS, ALLOWED_MCP_TOOLS } from "../tools"
 import { buildAgentDefinitionsFromTool } from "../agentDefs"
 import { fuzzyMatchAgentName } from "../agentMatch"
+import { resolvePassthrough } from "../../env"
 
 export const openCodeTransforms: Transform[] = [
   {
     name: "opencode-core",
-    adapters: ["opencode"],
+    // "openai" (/v1/chat/completions) and "codex" (/v1/responses) reuse this
+    // pipeline via the transform registry; each must be listed here or the
+    // transform is skipped and clients get built-in tools unblocked +
+    // passthrough off (#546). Codex additionally FORCES passthrough on via a
+    // follow-on transform (#475).
+    adapters: ["opencode", "openai", "codex"],
 
     onRequest(ctx: RequestContext): RequestContext {
       const body = ctx.body
@@ -18,9 +24,8 @@ export const openCodeTransforms: Transform[] = [
       const allowedMcpTools = ALLOWED_MCP_TOOLS
       const coreToolNames: readonly string[] = ["read", "write", "edit", "bash", "glob", "grep"]
 
-      // Passthrough mode (env var, default true)
-      const envVal = process.env.MERIDIAN_PASSTHROUGH ?? process.env.CLAUDE_PROXY_PASSTHROUGH
-      const passthrough = !(envVal === "0" || envVal === "false" || envVal === "no")
+      // Passthrough mode (env var, default true). Mirrors opencodeAdapter.usesPassthrough().
+      const passthrough = resolvePassthrough(true)
 
       // SDK agents (parse Task tool description)
       let sdkAgents: Record<string, any> = {}

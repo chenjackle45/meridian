@@ -399,3 +399,91 @@ describe("PreToolUse hook: passthrough ToolSearch", () => {
     expect(result.reason.toLowerCase()).toContain("end your turn")
   })
 })
+
+describe("PreToolUse hook: deny reasons must not promise delivery for dropped calls (#552)", () => {
+  // Root cause of the "read tool is returning the wrong file" confusion:
+  // dropped calls (same-tool repeat / forced single) received the same deny
+  // text as forwarded calls — "forwarded to the client ... result will be
+  // delivered in a future turn". That promise persists in the resumed SDK
+  // session's history, so next turn the model remembers a pending call whose
+  // result never arrives and misattributes the results it does receive.
+  //
+  // Runs under the early-stop kill switch: with early stop ON (default),
+  // same-tool re-calls are captured as genuine parallelism and get the
+  // normal forwarded reason — the dropped-call reason only applies in
+  // legacy mode (and to forced-single, which is mode-independent).
+  let savedEarlyStop: string | undefined
+  beforeEach(() => {
+    savedPassthrough = process.env.MERIDIAN_PASSTHROUGH
+    savedEarlyStop = process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
+    process.env.MERIDIAN_PASSTHROUGH = "1"
+    process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP = "0"
+    mockMessages = [assistantMessage([{ type: "text", text: "Done" }])]
+    capturedQueryParams = null
+    clearSessionCache()
+  })
+
+  afterEach(() => {
+    if (savedPassthrough !== undefined) process.env.MERIDIAN_PASSTHROUGH = savedPassthrough
+    else delete process.env.MERIDIAN_PASSTHROUGH
+    if (savedEarlyStop !== undefined) process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP = savedEarlyStop
+    else delete process.env.MERIDIAN_PASSTHROUGH_EARLY_STOP
+  })
+
+  async function getHook(body: Record<string, unknown> = {}) {
+    const app = createTestApp()
+    await (await post(app, {
+      model: "claude-sonnet-4-5",
+      max_tokens: 1024,
+      stream: false,
+      messages: [{ role: "user", content: "hello" }],
+      ...body,
+    })).json()
+    const allMatcher = capturedQueryParams.options.hooks.PreToolUse.find((h: any) => h.matcher === "")
+    return allMatcher.hooks[0]
+  }
+
+  const callHook = (hookFn: any, id: string, input: Record<string, unknown>) =>
+    hookFn({
+      hook_event_name: "PreToolUse",
+      tool_name: "read",
+      tool_input: input,
+      tool_use_id: id,
+    }, undefined, { signal: new AbortController().signal })
+
+  it("forwarded (captured) calls keep the delivery promise", async () => {
+    const hookFn = await getHook()
+    const result = await callHook(hookFn, "toolu_a", { file_path: "/a.txt" })
+    expect(result.decision).toBe("block")
+    expect(result.reason).toContain("forwarded to the client for execution")
+  })
+
+  it("same-tool re-calls with new args say NOT executed and to re-issue — no delivery promise", async () => {
+    const hookFn = await getHook()
+    await callHook(hookFn, "toolu_a", { file_path: "/a.txt" })
+    const result = await callHook(hookFn, "toolu_b", { file_path: "/b.txt" })
+    expect(result.decision).toBe("block")
+    expect(result.reason).not.toContain("forwarded to the client for execution")
+    expect(result.reason).not.toContain("will be delivered")
+    expect(result.reason.toLowerCase()).toContain("not executed")
+    expect(result.reason.toLowerCase()).toContain("re-issue")
+  })
+
+  it("exact duplicate re-emits say already forwarded — no second delivery promise", async () => {
+    const hookFn = await getHook()
+    await callHook(hookFn, "toolu_a", { file_path: "/a.txt" })
+    const result = await callHook(hookFn, "toolu_a2", { file_path: "/a.txt" })
+    expect(result.decision).toBe("block")
+    expect(result.reason.toLowerCase()).toContain("already")
+    expect(result.reason).not.toContain("will be delivered")
+  })
+
+  it("forced-single overflow says NOT executed — no delivery promise", async () => {
+    const hookFn = await getHook({ tool_choice: { type: "tool", name: "read" } })
+    await callHook(hookFn, "toolu_a", { file_path: "/a.txt" })
+    const result = await callHook(hookFn, "toolu_b", { file_path: "/b.txt" })
+    expect(result.decision).toBe("block")
+    expect(result.reason.toLowerCase()).toContain("not executed")
+    expect(result.reason).not.toContain("will be delivered")
+  })
+})
