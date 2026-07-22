@@ -38,6 +38,8 @@ export interface StoredSession {
   sdkMessageUuids?: Array<string | null>
   /** Last observed token usage for this Claude session */
   contextUsage?: TokenUsage
+  /** Hash of the client system context relocated into this SDK session's first user turn */
+  relocatedContextHash?: string
   /** Previous Claude session ID preserved when the session mapping is replaced.
    *  Enables recovery when a lineage bug (e.g. false compaction) causes the
    *  original session to be abandoned and a new one started. */
@@ -202,7 +204,8 @@ export function storeSharedSession(
   lineageHash?: string,
   messageHashes?: string[],
   sdkMessageUuids?: Array<string | null>,
-  contextUsage?: TokenUsage
+  contextUsage?: TokenUsage,
+  relocatedContextHash?: string
 ): void {
   const path = getStorePath()
   const lockPath = `${path}.lock`
@@ -229,6 +232,7 @@ export function storeSharedSession(
       messageHashes: messageHashes ?? existing?.messageHashes,
       sdkMessageUuids: sdkMessageUuids ?? existing?.sdkMessageUuids,
       contextUsage: contextUsage ?? existing?.contextUsage,
+      ...(relocatedContextHash ? { relocatedContextHash } : {}),
       ...(previousClaudeSessionId ? { previousClaudeSessionId } : {}),
     }
 

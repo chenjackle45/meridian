@@ -14,6 +14,8 @@ export interface AdapterFeatures {
   codeSystemPrompt: boolean
   /** Include the client agent's system prompt (e.g. OpenCode/Crush instructions) */
   clientSystemPrompt: boolean
+  /** Move the client agent's system prompt into the first user turn of fresh sessions */
+  relocateSystemPrompt: boolean
   /** Load CLAUDE.md instruction files (off, project, full) */
   claudeMd: "off" | "project" | "full"
   /** Enable auto-memory (read + write across sessions) */
@@ -45,6 +47,7 @@ const DEFAULT_FEATURES: AdapterFeatures = {
   // be encoded here. ADAPTER_DEFAULTS overrides this for passthrough below.
   codeSystemPrompt: true,
   clientSystemPrompt: true,
+  relocateSystemPrompt: false,
   claudeMd: "off" as const,
   memory: false,
   dreaming: false,
