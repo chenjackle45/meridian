@@ -533,6 +533,37 @@ describe("buildQueryOptions", () => {
     expect((result.options as any).systemPrompt).toBe("Agent instructions")
   })
 
+  it("keeps system prompt behavior identical when relocation is disabled", () => {
+    const current = buildQueryOptions(makeContext({
+      systemContext: "OpenClaw agent instructions",
+      codeSystemPrompt: true,
+      clientSystemPrompt: true,
+    }))
+    const disabled = buildQueryOptions(makeContext({
+      systemContext: "OpenClaw agent instructions",
+      codeSystemPrompt: true,
+      clientSystemPrompt: true,
+      relocateSystemPrompt: false,
+    }))
+    expect(disabled.options.systemPrompt).toEqual(current.options.systemPrompt)
+    expect(disabled.prompt).toBe(current.prompt)
+  })
+
+  it("removes client context from the system slot while preserving preset and cwd note when relocation is enabled", () => {
+    const result = buildQueryOptions(makeContext({
+      systemContext: "OpenClaw agent instructions",
+      clientWorkingDirectory: "/client/project",
+      codeSystemPrompt: true,
+      clientSystemPrompt: true,
+      relocateSystemPrompt: true,
+    }))
+    const sp = (result.options as any).systemPrompt
+    expect(sp.type).toBe("preset")
+    expect(sp.preset).toBe("claude_code")
+    expect(sp.append).toContain("Working directory: /client/project")
+    expect(sp.append).not.toContain("agent instructions")
+  })
+
   it("all three controls work together: preset + client + settingSources", () => {
     const result = buildQueryOptions(makeContext({
       passthrough: true,

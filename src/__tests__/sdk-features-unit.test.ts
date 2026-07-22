@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import {
+  getFeaturesForAdapter,
   validateFeatureUpdate,
   type AdapterFeatures,
 } from "../proxy/sdkFeatures"
@@ -21,6 +22,12 @@ describe("validateFeatureUpdate", () => {
   it("accepts codeSystemPrompt and clientSystemPrompt booleans", () => {
     expect(validateFeatureUpdate({ codeSystemPrompt: true })).toEqual({ codeSystemPrompt: true })
     expect(validateFeatureUpdate({ clientSystemPrompt: false })).toEqual({ clientSystemPrompt: false })
+  })
+
+  it("defaults relocateSystemPrompt to false and validates boolean updates", () => {
+    expect(getFeaturesForAdapter("__relocate-system-prompt-test__").relocateSystemPrompt).toBe(false)
+    expect(validateFeatureUpdate({ relocateSystemPrompt: true })).toEqual({ relocateSystemPrompt: true })
+    expect(() => validateFeatureUpdate({ relocateSystemPrompt: "yes" })).toThrow("relocateSystemPrompt must be a boolean")
   })
 
   it("rejects non-boolean for system prompt toggles", () => {
